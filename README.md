@@ -1,33 +1,42 @@
-# PGA-Trans-HAR: Prior-Guided Attention Spatio-Temporal Transformer for Global Stock Market Volatility Forecasting
+# PGA-Trans-HAR
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
-[![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0%2B-red.svg)](https://pytorch.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Official implementation for the preprint paper:  
+**Forecasting Global Volatility Across Asynchronous Markets: Incremental Accuracy from Constrained Cross-Market Attention**
 
-Official PyTorch implementation of the paper: **"Prior-Guided Attention Spatio-Temporal Transformer for Global Stock Market Volatility Forecasting"**.
-
----
-
-## 📖 Overview
-**PGA-Trans-HAR** is a hybrid deep learning and econometric framework designed for global multi-market realized volatility (RV) forecasting. It bridges modern Spatio-Temporal Transformers with classical Heterogeneous Autoregressive (HAR) models, introducing **Prior-Guided Attention (PGA)** and **Attention Padding Masks** to address key empirical challenges in financial time-series forecasting:
-1. **Non-Common Trading Days (Holiday Mismatches)**: Elegantly aligns asynchronous international trading calendars using softmax-based attention masking without recurrent zero-padding noise.
-2. **Spatial-Temporal Non-Linearity**: Replaces sequential recurrent bottlenecks (e.g., DCGRU) with parallelizable spatio-temporal self-attention.
-3. **Econometric Prior Regularization**: Integrates Diebold-Yilmaz (2012) Vector Autoregression (VAR) GFEVD prior graphs into spatial attention via adaptive node-specific gating to prevent overfitting against high-frequency market noise.
+**Authors:** Xinlin Zhao, Haotian Qiao, Ziyao Lin  
+**Repository:** [https://github.com/cillinzhao/PGA-Trans-HAR](https://github.com/cillinzhao/PGA-Trans-HAR)
 
 ---
 
-## 📂 Project Structure
+## 📌 Overview
+
+Multivariate volatility forecasting across international equity markets presents a fundamental **information-set problem**: asynchronous exchange closures dictate which market observations strictly belong to the information filtration at any given forecast origin $o = t - h$.
+
+**PGA-Trans-HAR** is a parsimonious, econometrically regularized forecasting system designed to extract genuine incremental predictive accuracy over the univariate HAR benchmark without unconstrained overfitting.
+
+### Key Methodological Components:
+1. **Forecast-Origin-Admissible Information Alignment:** Formulated on a union calendar ($T = 4,079$ days) distinguishing observed trading days from exchange closures ($m_{t,n} \in \{0, 1\}$). All rolling inputs and graph priors are strictly indexed by the forecast origin $o = t - h$.
+2. **Origin-Admissible Predictive-Connectedness Prior:** A rolling ridge-VAR($p=2$) / GFEVD($H_g=22$) directional connectedness prior, dynamically refreshed every $K_g = 20$ forecast origins over a trailing window $W_g \le 252$.
+3. **Constrained Cross-Market Attention:** Combines data-driven spatial self-attention $A^D$ and the rolling GFEVD prior $\tilde{P}$ via a learned, time-invariant market-specific gating vector $g_n = \sigma(\gamma_n)$.
+4. **Asymmetric Masking Mechanism:** Prevents closed exchanges from acting as temporal/spatial key-value sources (avoiding spurious zero-volatility transmission) while retaining them as query destinations.
+5. **Frozen Direct-Horizon HAR Baseline Anchor:** Residual neural learning bounded in the inverse-softplus domain:
+   $$\hat{x}_{t,n}^{(h)} = \text{softplus}\left( \text{softplus}^{-1}(\hat{x}_{t,n}^{\text{HAR},(h)}) + \alpha_n r_{b,n} \delta_{b,n} \right)$$
+6. **Node-Balanced Objective:** Smooth-worst HAR-relative regret penalty ($\lambda=0.10, \tau=0.20$) to prevent buying aggregate performance at the expense of isolated market deterioration.
+
+---
+
+## 📂 Repository Structure
+
 ```text
 PGA-Trans-HAR/
-│
-├── data/
-│   └── df_union_sqrt.csv          # Local high-frequency realized volatility dataset
-│
-├── models/                        # Core model architectures
-│   ├── PGA-TRANS-HAR (including experimental version of module ablation).ipynb              # PGA-TRANS-HAR Structure with Outcome
-│   ├── PGA-TRANS-HAR (including experimental version of module ablation).py                     # PGA-TRANS-HAR Structure
-│   
-│
-│
-├── requirements.txt               # Python package dependencies
-└── README.md                      # Project documentation
+├── ablation/                 # Structural ablation implementations
+│   ├── pga_ablation_v5_hn.py           
+├── baselines/                # External econometric & deep learning baselines
+│   ├── baseline_v5_hn.py              
+├── data/                     # Dataset and union calendar processing
+│   ├── df_union_sqrt.csv     # Pre-transformed percentage square-root RV panel
+├── models/                   # Core proposed architecture
+│   ├── pga_trans_har_v5_hn.py     
+├── .gitignore
+├── README.md
+└── requirements.txt
