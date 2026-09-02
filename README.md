@@ -30,13 +30,13 @@ Multivariate volatility forecasting across international equity markets presents
 ```text
 PGA-Trans-HAR/
 ├── ablation/                 # Structural ablation implementations
-│   ├── pga_ablation_v5_hn.py           
+│   ├── pga_ablation.py           
 ├── baselines/                # External econometric & deep learning baselines
 │   ├── baseline_v5_hn.py              
 ├── data/                     # Dataset and union calendar processing
 │   ├── df_union_sqrt.csv     # Pre-transformed percentage square-root RV panel
 ├── models/                   # Core proposed architecture
-│   ├── pga_trans_har_v5_hn.py     
+│   ├── pga_trans_har.py     
 ├── .gitignore
 ├── README.md
 └── requirements.txt
