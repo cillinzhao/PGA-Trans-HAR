@@ -1,26 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[2]:
+# In[1]:
 
-
-#!/usr/bin/env python3
-"""Nested PGA-Trans-HAR V5 ablation experiments for h=1, 5, 22.
-
-Experiments
------------
-HAR + Temporal MHSA
-HAR + Dynamic Prior Graph
-HAR + MHSA + Dynamic Graph
-Full PGA with fixed g
-
-Every trainable ablation shares the same frozen HAR anchor, residual head,
-dynamic residual gate r, robust MSE objective, rolling graph sequence and
-60/10/30 validation/refit protocol. Components are added monotonically so
-differences can be attributed to the named component.
-
-Note: Pure HAR and Full PGA (dynamic_g) are excluded as they are evaluated in the main/baseline runs.
-"""
 
 from __future__ import annotations
 
@@ -38,18 +20,148 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# 依赖于已经添加了 horizon 参数的 pga_trans_har_v5.py
+
 import pga_trans_har_v5_hn_fixed as core
 
 
 ABLATION_NAMES = {
+    "pure_transformer": "Pure-ST-Transformer",
     "temporal": "HAR+Temporal-MHSA",
     "dynamic_graph": "HAR+Dynamic-Prior-Graph",
     "temporal_dynamic_graph": "HAR+MHSA+Dynamic-Graph",
     "fixed_g": "PGA-Fixed-g",
 }
 TRAINABLE_ABLATIONS = tuple(ABLATION_NAMES.keys())
+
+
+class DataDrivenSpatialAttention(nn.Module):
+    """Spatial self-attention with no graph prior or prior/data gate."""
+
+    def __init__(self, hidden_dim, dropout):
+        super().__init__()
+        self.q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.attention_dropout = nn.Dropout(dropout)
+        self.scale = hidden_dim ** -0.5
+
+    def forward(self, x, x_mask, return_gate=False):
+        B, S, N, H = x.shape
+        q = self.q(x).reshape(B * S, N, H)
+        k = self.k(x).reshape(B * S, N, H)
+        v = self.v(x).reshape(B * S, N, H)
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale
+
+        # Closed/missing markets may receive information as queries, but are
+        # never allowed to act as keys/values for another market.
+        source_active = x_mask[..., 0].reshape(B * S, N)
+        key_mask = source_active[:, None, :].expand(-1, N, -1)
+        attention = core.masked_softmax(scores, key_mask)
+        output = torch.bmm(self.attention_dropout(attention), v)
+        output = self.out(output.reshape(B, S, N, H))
+
+        # g=1 is a diagnostic convention meaning 100% data attention. It is
+        # fixed, not a parameter of the pure Transformer.
+        gate = torch.ones((B, S, N), dtype=x.dtype, device=x.device)
+        return output, (gate if return_gate else None)
+
+
+class PureTransformerBlock(nn.Module):
+    def __init__(self, hidden_dim, num_nodes, seq_len, num_heads, dropout):
+        super().__init__()
+        self.temporal = core.MultiHeadTemporalAttention(
+            hidden_dim, num_heads, dropout
+        )
+        self.spatial = DataDrivenSpatialAttention(hidden_dim, dropout)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm3 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, x_mask, prior, return_gate=False):
+        del prior  # Explicitly guarantee that this model cannot use the DY prior.
+        x = self.norm1(x + self.dropout(self.temporal(x, x_mask)))
+        spatial, gate = self.spatial(x, x_mask, return_gate=return_gate)
+        x = self.norm2(x + self.dropout(spatial))
+        x = self.norm3(x + self.ffn(x))
+        return x, gate
+
+
+class PureSTTransformer(nn.Module):
+    """Pure spatio-temporal Transformer without any HAR/PGA component."""
+
+    def __init__(
+        self,
+        num_nodes,
+        seq_len=22,
+        hidden_dim=32,
+        num_blocks=2,
+        num_heads=4,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.input_projection = nn.Linear(2, hidden_dim)
+        self.position_embedding = nn.Parameter(
+            torch.randn(1, seq_len, 1, hidden_dim) * 0.02
+        )
+        self.node_embedding = nn.Parameter(
+            torch.randn(1, 1, num_nodes, hidden_dim) * 0.02
+        )
+        self.blocks = nn.ModuleList(
+            [
+                PureTransformerBlock(
+                    hidden_dim, num_nodes, seq_len, num_heads, dropout
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+        output_hidden = max(hidden_dim // 2, 8)
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden_dim, output_hidden),
+            nn.GELU(),
+            nn.Linear(output_hidden, 1),
+        )
+
+        # Compatibility-only non-trainable diagnostic. The pure Transformer
+        # has neither an HAR residual nor an alpha coefficient.
+        self.register_buffer("alpha_raw", torch.zeros(num_nodes, 1))
+
+    def forward(self, x, x_mask, prior, return_aux=False):
+        hidden = (
+            self.input_projection(torch.cat([x, x_mask], dim=-1))
+            + self.position_embedding
+            + self.node_embedding
+        )
+        gates = []
+        for block in self.blocks:
+            hidden, gate = block(hidden, x_mask, prior, return_gate=return_aux)
+            if return_aux:
+                gates.append(gate)
+
+        prediction = F.softplus(self.output_head(hidden[:, -1])).clamp_min(
+            core.EPS
+        )
+        if not return_aux:
+            return prediction
+
+        unavailable = torch.full_like(prediction, float("nan"))
+        return prediction, {
+            "attention_gate": torch.stack(gates, dim=0),
+            "residual_gate": unavailable,
+            "alpha": self.alpha_raw[None, :, :],
+            "har_anchor": unavailable,
+            "residual": unavailable,
+        }
 
 
 class TemporalOnlyBlock(nn.Module):
@@ -254,18 +366,28 @@ def build_ablation_model(
     device,
 ):
     core.set_seed(seed)
-    model = AblationModel(
-        ablation=ablation,
-        fixed_g=fixed_g,
-        num_nodes=num_nodes,
-        har_coefficients=har_coefficients,
-        seq_len=config.seq_len,
-        hidden_dim=config.hidden_dim,
-        num_blocks=config.num_blocks,
-        num_heads=config.num_heads,
-        dropout=config.dropout,
-        max_residual_scale=config.max_residual_scale,
-    )
+    if ablation == "pure_transformer":
+        model = PureSTTransformer(
+            num_nodes=num_nodes,
+            seq_len=config.seq_len,
+            hidden_dim=config.hidden_dim,
+            num_blocks=config.num_blocks,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+        )
+    else:
+        model = AblationModel(
+            ablation=ablation,
+            fixed_g=fixed_g,
+            num_nodes=num_nodes,
+            har_coefficients=har_coefficients,
+            seq_len=config.seq_len,
+            hidden_dim=config.hidden_dim,
+            num_blocks=config.num_blocks,
+            num_heads=config.num_heads,
+            dropout=config.dropout,
+            max_residual_scale=config.max_residual_scale,
+        )
     return model.to(device)
 
 
@@ -419,7 +541,7 @@ def main():
 
     global_frames, global_metrics, global_histories, global_gates, global_inventory = [], [], [], [], []
 
-    # --- 外层遍历 Horizon ---
+  
     for h in args.horizons:
         print(f"\n{'='*60}")
         print(f"=== Starting Ablation Horizon: h = {h} ===")
@@ -428,7 +550,7 @@ def main():
         validation_target_start = train_end + h - 1
         test_target_start = val_end + h - 1
 
-        # 构建支持 horizon 的 Windows
+        
         train_windows = core.make_windows(values, args.seq_len, train_end, args.seq_len, horizon=h)
         val_windows = core.make_windows(
             values, validation_target_start, val_end, args.seq_len, horizon=h
@@ -468,7 +590,7 @@ def main():
         val_loader = core.make_loader(val_data, config.batch_size, False)
         test_loader = core.make_loader(test_data, config.batch_size, False)
         
-        # 使用特定 horizon 计算 HAR anchor 和 MSE reference
+        
         har_dev = core.fit_har_anchor(values, train_end, args.seq_len, horizon=h)
         scale_dev, har_mse_dev = core.training_statistics(
             values, train_end, args.seq_len, har_dev, horizon=h
@@ -482,7 +604,7 @@ def main():
         h_dir.mkdir(parents=True, exist_ok=True)
         graph_diagnostics.to_csv(h_dir / f"dynamic_graph_diagnostics_h{h}.csv", index=False)
 
-        # 进行所有配置的训练验证
+        
         for ablation in TRAINABLE_ABLATIONS:
             if ablation not in args.ablations:
                 continue
@@ -542,10 +664,14 @@ def main():
                 metrics = metric_frame(model_name, seed, arrays, names, horizon=h)
                 metrics["selected_epoch"] = selected_epoch
                 metrics["final_train_objective"] = final_train_loss
-                alpha = (
-                    config.max_residual_scale
-                    * torch.tanh(final_model.alpha_raw.detach())
-                ).cpu().numpy()[:, 0]
+                if ablation == "pure_transformer":
+                    # Not zero: alpha is structurally absent from this model.
+                    alpha = np.full(len(names), np.nan, dtype=np.float32)
+                else:
+                    alpha = (
+                        config.max_residual_scale
+                        * torch.tanh(final_model.alpha_raw.detach())
+                    ).cpu().numpy()[:, 0]
                 gate = ablation_gate_frame(
                     model_name, seed, arrays, dates, names, alpha, horizon=h
                 )
@@ -628,8 +754,11 @@ def main():
                 "train_config": asdict(config),
                 "reported_metrics": ["MSE", "MAE"],
                 "component_control": (
-                    "All trainable ablations share HAR anchor, residual head, "
-                    "residual gate r and robust MSE; only named graph/MHSA/g components vary."
+                    "Pure-ST-Transformer contains temporal MHSA and data-only spatial "
+                    "self-attention, with no HAR anchor, DY prior, residual fusion or PGA "
+                    "gate. HAR-based ablations retain their common HAR anchor, residual "
+                    "head, residual gate r and robust MSE. All models share the same data "
+                    "splits, training objective, validation/refit protocol and seeds."
                 ),
             },
             stream,
@@ -647,6 +776,13 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
 
 
 # In[ ]:

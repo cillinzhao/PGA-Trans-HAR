@@ -480,7 +480,12 @@ class MultiHeadTemporalAttention(nn.Module):
 
 
 class DynamicPriorGuidedSpatialAttention(nn.Module):
-    """Spatial attention with g=1 for data attention and g=0 for prior."""
+    """Fuse data attention and the dynamic prior using a supplied fixed gate.
+
+    ``gate_by_node[n]`` is learned once for market ``n`` and is shared across
+    every sample, date, lookback position and spatio-temporal block.  As in the
+    paper, g=1 selects data-driven spatial attention and g=0 selects the prior.
+    """
 
     def __init__(
         self,
@@ -488,8 +493,6 @@ class DynamicPriorGuidedSpatialAttention(nn.Module):
         num_nodes: int,
         seq_len: int,
         dropout: float,
-        node_emb_dim: int = 8,
-        time_emb_dim: int = 8,
     ):
         super().__init__()
         self.num_nodes = num_nodes
@@ -498,15 +501,6 @@ class DynamicPriorGuidedSpatialAttention(nn.Module):
         self.k = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.out = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.node_embedding = nn.Parameter(torch.randn(num_nodes, node_emb_dim) * 0.02)
-        self.time_embedding = nn.Parameter(torch.randn(seq_len, time_emb_dim) * 0.02)
-        self.gate_net = nn.Sequential(
-            nn.Linear(hidden_dim + node_emb_dim + time_emb_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.gate_intercept = nn.Parameter(torch.full((num_nodes, 1), -0.5))
         self.attention_dropout = nn.Dropout(dropout)
         self.scale = hidden_dim ** -0.5
 
@@ -515,9 +509,15 @@ class DynamicPriorGuidedSpatialAttention(nn.Module):
         x: torch.Tensor,
         x_mask: torch.Tensor,
         prior: torch.Tensor,
+        gate_by_node: torch.Tensor,
         return_gate: bool = False,
     ):
         B, S, N, H = x.shape
+        if gate_by_node.shape != (N,):
+            raise ValueError(
+                f"Expected one fixed gate per market with shape {(N,)}, "
+                f"got {tuple(gate_by_node.shape)}."
+            )
         q = self.q(x).reshape(B * S, N, H)
         k = self.k(x).reshape(B * S, N, H)
         v = self.v(x).reshape(B * S, N, H)
@@ -538,20 +538,16 @@ class DynamicPriorGuidedSpatialAttention(nn.Module):
             prior_sum > 1e-12, normalized_prior, data_attention
         )
 
-        node_emb = self.node_embedding[None, None, :, :].expand(B, S, -1, -1)
-        time_emb = self.time_embedding[None, :, None, :].expand(B, -1, N, -1)
-        gate_input = torch.cat([x, node_emb, time_emb], dim=-1)
-        gate = torch.sigmoid(
-            self.gate_net(gate_input)
-            + self.gate_intercept[None, None, :, :]
-        ).reshape(B * S, N, 1)
+        # The same learned g_n is used for every date and every observation.
+        # expand() preserves gradient flow to the shared num_nodes parameters.
+        gate = gate_by_node.view(1, N, 1).expand(B * S, -1, -1)
 
         hybrid = gate * data_attention + (1.0 - gate) * normalized_prior
         hybrid = self.attention_dropout(hybrid)
         output = torch.bmm(hybrid, v).reshape(B, S, N, H)
         output = self.out(output)
-        gate = gate.reshape(B, S, N)
-        return output, (gate if return_gate else None)
+        exported_gate = gate.reshape(B, S, N)
+        return output, (exported_gate if return_gate else None)
 
 
 class SpatioTemporalBlock(nn.Module):
@@ -580,12 +576,18 @@ class SpatioTemporalBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, x_mask, prior, return_gate=False):
+    def forward(self, x, x_mask, prior, gate_by_node, return_gate=False):
         # Inactive nodes are allowed to receive information.  They are excluded
         # only as sources/keys, not destroyed as target/query states.
         temporal = self.temporal(x, x_mask)
         x = self.norm1(x + self.dropout(temporal))
-        spatial, gate = self.spatial(x, x_mask, prior, return_gate=return_gate)
+        spatial, gate = self.spatial(
+            x,
+            x_mask,
+            prior,
+            gate_by_node=gate_by_node,
+            return_gate=return_gate,
+        )
         x = self.norm2(x + self.dropout(spatial))
         x = self.norm3(x + self.ffn(x))
         return x, gate
@@ -639,6 +641,11 @@ class PGATransHARV5(nn.Module):
         self.node_embedding = nn.Parameter(
             torch.randn(1, 1, num_nodes, hidden_dim) * 0.02
         )
+        # One unconstrained trainable logit per market.  sigmoid(-0.5) is about
+        # 0.378, matching the original gate-intercept initialization while
+        # removing all sample/date dependence.  This vector is shared by every
+        # spatio-temporal block, so the model has exactly N attention gates.
+        self.attention_gate_logits = nn.Parameter(torch.full((num_nodes,), -0.5))
         self.blocks = nn.ModuleList(
             [
                 SpatioTemporalBlock(
@@ -688,9 +695,14 @@ class PGATransHARV5(nn.Module):
             + self.node_embedding
         )
         gates = []
+        fixed_gate_by_node = torch.sigmoid(self.attention_gate_logits)
         for block in self.blocks:
             hidden, gate = block(
-                hidden, x_mask, prior, return_gate=return_aux
+                hidden,
+                x_mask,
+                prior,
+                gate_by_node=fixed_gate_by_node,
+                return_gate=return_aux,
             )
             if return_aux:
                 gates.append(gate)
@@ -714,6 +726,7 @@ class PGATransHARV5(nn.Module):
             return prediction
         return prediction, {
             "attention_gate": torch.stack(gates, dim=0),
+            "fixed_attention_gate_by_node": fixed_gate_by_node,
             "residual_gate": residual_gate,
             "alpha": alpha,
             "har_anchor": anchor,
@@ -1032,7 +1045,9 @@ def prediction_frame(arrays, dates, names, seed, horizon) -> pd.DataFrame:
 
 def gate_frame(arrays, dates, names, seed, alpha, horizon) -> pd.DataFrame:
     attention = arrays["attention_gate"]
-    # Last block, final calendar input position; also retain window average.
+    # With fixed per-market gating these two columns must be identical for all
+    # dates and positions.  They are retained for compatibility with the V5
+    # Figure 4 pipeline and provide a direct invariance check.
     last_gate = attention[-1, :, -1, :]
     window_gate = attention[-1].mean(axis=1)
     rows = []
@@ -1049,6 +1064,7 @@ def gate_frame(arrays, dates, names, seed, alpha, horizon) -> pd.DataFrame:
                     "node_name": name,
                     "attention_gate_g": float(last_gate[row, node]),
                     "attention_gate_g_window_mean": float(window_gate[row, node]),
+                    "attention_gate_scope": "fixed_by_market",
                     "residual_gate_r": float(arrays["residual_gate"][row, node]),
                     "node_residual_scale_alpha": float(alpha[node]),
                     "har_anchor": float(arrays["har_anchor"][row, node]),
@@ -1057,6 +1073,26 @@ def gate_frame(arrays, dates, names, seed, alpha, horizon) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def fixed_attention_gate_frame(model, names, seed, horizon) -> pd.DataFrame:
+    """Return one learned, time-invariant attention gate for each market."""
+    logits = model.attention_gate_logits.detach().cpu().numpy()
+    gates = torch.sigmoid(model.attention_gate_logits.detach()).cpu().numpy()
+    return pd.DataFrame(
+        {
+            "model": MODEL_NAME,
+            "horizon": int(horizon),
+            "seed": int(seed),
+            "node": np.arange(len(names), dtype=int),
+            "node_name": list(names),
+            "attention_gate_logit": logits,
+            "attention_gate_g": gates,
+            "data_attention_weight": gates,
+            "prior_graph_weight": 1.0 - gates,
+            "gate_scope": "fixed_by_market_shared_across_dates_and_blocks",
+        }
+    )
 
 
 def summarize_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
@@ -1159,7 +1195,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="df_union_sqrt.csv", help="CSV path, e.g. df_union_sqrt.csv")
     parser.add_argument("--input-format", choices=["sqrt_rv", "rv"], default="sqrt_rv")
-    parser.add_argument("--outdir", default="pga_results_v5")
+    parser.add_argument("--outdir", default="pga_results_v5_fixed_node_gate")
     parser.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 22])  # 新增 horizons 参数
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3, 4, 5])
     parser.add_argument("--train-ratio", type=float, default=0.60)
@@ -1323,7 +1359,9 @@ def main() -> None:
         all_manifest.to_csv(outdir_h / f"test_date_manifest_all_days_h{h}.csv", index=False)
         common_manifest.to_csv(outdir_h / f"test_date_manifest_common_days_h{h}.csv", index=False)
 
-        all_metrics, all_predictions, all_gates, histories = [], [], [], []
+        all_metrics, all_predictions, all_gates, all_fixed_gates, histories = (
+            [], [], [], [], []
+        )
         
         for seed in args.seeds:
             print(f"\n--- [h={h}] Seed {seed}: development training and validation ---", flush=True)
@@ -1406,6 +1444,9 @@ def main() -> None:
                 * torch.tanh(final_model.alpha_raw.detach())
             ).cpu().numpy()[:, 0]
             gates = gate_frame(test_arrays, dates, names, seed, alpha, horizon=h)
+            fixed_gates = fixed_attention_gate_frame(
+                final_model, names, seed, horizon=h
+            )
 
             seed_dir = outdir_h / f"seed{seed}"
             seed_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,6 +1455,10 @@ def main() -> None:
                 seed_dir / f"{MODEL_NAME}_h{h}_seed{seed}_predictions.csv", index=False
             )
             gates.to_csv(seed_dir / f"gates_h{h}_seed{seed}.csv", index=False)
+            fixed_gates.to_csv(
+                seed_dir / f"fixed_attention_gates_h{h}_seed{seed}.csv",
+                index=False,
+            )
             
             torch.save(
                 {
@@ -1422,6 +1467,13 @@ def main() -> None:
                     "selected_epoch": best_epoch,
                     "train_config": asdict(config),
                     "har_coefficients": final_alpha_reference,
+                    "attention_gate_parameterization": (
+                        "g_n=sigmoid(attention_gate_logits[n]); "
+                        "shared_across_dates_samples_and_blocks"
+                    ),
+                    "fixed_attention_gate_by_node": torch.sigmoid(
+                        final_model.attention_gate_logits.detach()
+                    ).cpu(),
                 },
                 seed_dir / f"model_h{h}_seed{seed}.pt",
             )
@@ -1429,11 +1481,13 @@ def main() -> None:
             all_metrics.append(metrics)
             all_predictions.append(predictions)
             all_gates.append(gates)
+            all_fixed_gates.append(fixed_gates)
 
         # --- 整合当前 Horizon 的结果 ---
         metrics_frame = pd.concat(all_metrics, ignore_index=True)
         prediction_frame_all = pd.concat(all_predictions, ignore_index=True)
         gate_frame_all = pd.concat(all_gates, ignore_index=True)
+        fixed_gate_frame_all = pd.concat(all_fixed_gates, ignore_index=True)
         history_frame = pd.concat(histories, ignore_index=True)
         
         summary = summarize_metrics(metrics_frame)
@@ -1450,6 +1504,10 @@ def main() -> None:
         summary.to_csv(outdir_h / f"summary_mean_std_h{h}.csv", index=False)
         prediction_frame_all.to_csv(outdir_h / f"all_seed_predictions_h{h}.csv", index=False)
         gate_frame_all.to_csv(outdir_h / f"all_seed_gates_h{h}.csv", index=False)
+        fixed_gate_frame_all.to_csv(
+            outdir_h / f"fixed_attention_gates_all_seeds_h{h}.csv",
+            index=False,
+        )
         history_frame.to_csv(outdir_h / f"validation_history_h{h}.csv", index=False)
         ensemble.to_csv(outdir_h / f"seed_ensemble_predictions_h{h}.csv", index=False)
         ensemble_metrics.to_csv(outdir_h / f"seed_ensemble_metrics_h{h}.csv", index=False)
@@ -1518,7 +1576,13 @@ def main() -> None:
                     "softplus(inv_softplus(HAR_anchor) + "
                     "alpha_node * residual_gate_r * tanh(residual))"
                 ),
-                "attention_gate_interpretation": "g=1 data attention; g=0 prior graph",
+                "attention_gate_parameterization": (
+                    "one learned fixed gate per market: "
+                    "g_n=sigmoid(theta_n), shared across dates, samples, "
+                    "lookback positions and spatio-temporal blocks"
+                ),
+                "attention_gate_initial_value": float(torch.sigmoid(torch.tensor(-0.5))),
+                "attention_gate_interpretation": "g_n=1 data attention; g_n=0 prior graph",
                 "training_objective": (
                     "mean node-standardized MSE + lambda * "
                     "smooth-worst(node MSE / training HAR MSE - 1)"
@@ -1545,7 +1609,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-
-# In[ ]:
 
 
