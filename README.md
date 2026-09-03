@@ -8,20 +8,26 @@ Official implementation for the preprint paper:
 
 ---
 
-## 📌 Overview
+Official PyTorch implementation of the preprint:  
+**"Decoding Global Volatility Spillovers: A Neuro-Econometric Spatio-Temporal Transformer for Asynchronous Financial Markets"**  
+*Xinlin Zhao (Independent Researcher) and Haotian Qiao (University of Michigan, Ann Arbor)*  
+Contact: `cillinzhao@gmail.com` | `qhaotian@umich.edu`
 
-Multivariate volatility forecasting across international equity markets presents a fundamental **information-set problem**: asynchronous exchange closures dictate which market observations strictly belong to the information filtration at any given forecast origin $o = t - h$.
+---
 
-**PGA-Trans-HAR** is a parsimonious, econometrically regularized forecasting system designed to extract genuine incremental predictive accuracy over the univariate HAR benchmark without unconstrained overfitting.
+## 📌 Abstract & Overview
 
-### Key Methodological Components:
-1. **Forecast-Origin-Admissible Information Alignment:** Formulated on a union calendar ($T = 4,079$ days) distinguishing observed trading days from exchange closures ($m_{t,n} \in \{0, 1\}$). All rolling inputs and graph priors are strictly indexed by the forecast origin $o = t - h$.
-2. **Origin-Admissible Predictive-Connectedness Prior:** A rolling ridge-VAR($p=2$) / GFEVD($H_g=22$) directional connectedness prior, dynamically refreshed every $K_g = 20$ forecast origins over a trailing window $W_g \le 252$.
-3. **Constrained Cross-Market Attention:** Combines data-driven spatial self-attention $A^D$ and the rolling GFEVD prior $\tilde{P}$ via a learned, time-invariant market-specific gating vector $g_n = \sigma(\gamma_n)$.
-4. **Asymmetric Masking Mechanism:** Prevents closed exchanges from acting as temporal/spatial key-value sources (avoiding spurious zero-volatility transmission) while retaining them as query destinations.
-5. **Frozen Direct-Horizon HAR Baseline Anchor:** Residual neural learning bounded in the inverse-softplus domain:
+Forecasting multi-market realized volatility across international equity exchanges faces an inherent **asynchronous measurement challenge**: heterogeneous national holiday calendars create missing observations that disrupt temporal continuity. Naively truncating data to common trading days discards valid economic observations, whereas zero-filling closures creates spurious near-zero volatility signals and distorts cross-market spillover topologies.
+
+**PGA-Trans-HAR** resolves this bottleneck via a novel **neuro-econometric fusion** paradigm that strictly respects the forecast-origin information filtration ($o = t - h$):
+1. **Dynamic Econometric Prior:** A rolling Ridge-regularized VAR($p=2$) and Generalized Forecast Error Variance Decomposition (GFEVD, $H_g=22$) network is refreshed every $K_g=20$ origins over trailing window $W_g \le 252$ without look-ahead bias.
+2. **Asymmetric Source Masking:** Inactive markets are masked out as temporal/spatial key-value sources while retaining their query states, allowing closed markets to receive contemporaneous shocks without transmitting artificial closure signals.
+3. **Adaptive Convex Attention-Prior Gate:** A learned, market-specific gate $g_n = \sigma(\gamma_n)$ dynamically weights data-driven spatial self-attention and the rolling econometric prior.
+4. **Frozen HAR Knowledge Anchor:** Neural corrections are bounded via an inverse-softplus formulation:
    $$\hat{x}_{t,n}^{(h)} = \text{softplus}\left( \text{softplus}^{-1}(\hat{x}_{t,n}^{\text{HAR},(h)}) + \alpha_n r_{b,n} \delta_{b,n} \right)$$
-6. **Node-Balanced Objective:** Smooth-worst HAR-relative regret penalty ($\lambda=0.10, \tau=0.20$) to prevent buying aggregate performance at the expense of isolated market deterioration.
+   guaranteeing mathematical positivity and anchoring training stability.
+5. **Node-Balanced Regularization:** Minimizes node-standardized MSE combined with a smooth-worst HAR-relative regret penalty ($\lambda=0.10, \tau=0.20$) to guard against isolated market deterioration.
+
 
 ---
 
