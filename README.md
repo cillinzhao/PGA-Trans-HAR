@@ -23,11 +23,13 @@ Forecasting multi-market realized volatility across international equity exchang
 1. **Dynamic Econometric Prior:** A rolling Ridge-regularized VAR($p=2$) and Generalized Forecast Error Variance Decomposition (GFEVD, $H_g=22$) network is refreshed every $K_g=20$ origins over trailing window $W_g \le 252$ without look-ahead bias.
 2. **Asymmetric Source Masking:** Inactive markets are masked out as temporal/spatial key-value sources while retaining their query states, allowing closed markets to receive contemporaneous shocks without transmitting artificial closure signals.
 3. **Adaptive Convex Attention-Prior Gate:** A learned, market-specific gate $g_n = \sigma(\gamma_n)$ dynamically weights data-driven spatial self-attention and the rolling econometric prior.
-4. **Frozen HAR Knowledge Anchor:** Neural corrections are bounded via an inverse-softplus formulation:  
-   $$\hat{x}_{t,n}^{(h)} = \text{softplus}\left( \text{softplus}^{-1}(\hat{x}_{t,n}^{\text{HAR},(h)}) + \alpha_n r_{b,n} \delta_{b,n} \right)$$  
-   guaranteeing mathematical positivity and anchoring training stability.
-5. **Node-Balanced Regularization:** Minimizes node-standardized MSE combined with a smooth-worst HAR-relative regret penalty ($\lambda=0.10, \tau=0.20$) to guard against isolated market deterioration.
+4. **Frozen HAR Knowledge Anchor:** Neural corrections are bounded via an inverse-softplus formulation to guarantee mathematical positivity and training stability:
 
+$$
+\hat{x}_{t,n}^{(h)} = \mathrm{softplus}\left( \mathrm{softplus}^{-1}(\hat{x}_{t,n}^{\mathrm{HAR},(h)}) + \alpha_n r_{b,n} \delta_{b,n} \right)
+$$
+
+5. **Node-Balanced Regularization:** Minimizes node-standardized MSE combined with a smooth-worst HAR-relative regret penalty ($\lambda=0.10, \tau=0.20$) to guard against isolated market deterioration.
 
 ---
 
