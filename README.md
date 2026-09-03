@@ -3,7 +3,7 @@
 Official implementation for the preprint paper:  
 **Forecasting Global Volatility Across Asynchronous Markets: Incremental Accuracy from Constrained Cross-Market Attention**
 
-**Authors:** Xinlin Zhao, Haotian Qiao, Ziyao Lin  
+**Authors:** Xinlin Zhao, Haotian Qiao
 **Repository:** [https://github.com/cillinzhao/PGA-Trans-HAR](https://github.com/cillinzhao/PGA-Trans-HAR)
 
 ---
