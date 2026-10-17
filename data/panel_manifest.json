@@ -1,0 +1,39 @@
+{
+  "file": "data/df_union_sqrt.csv",
+  "sha256": "8d13af29b4534ba614ccce7bd7bf0bd24b29627ef3d280873a45792912143bb6",
+  "bytes": 442548,
+  "rows": 3531,
+  "dates": [
+    "2013-03-05",
+    "2026-09-28"
+  ],
+  "common_active_dates": 2870,
+  "columns": [
+    ".SPX",
+    ".GDAXI",
+    ".FCHI",
+    ".FTSE",
+    ".OMXSPI",
+    ".N225",
+    ".KS11",
+    ".HSI"
+  ],
+  "source": "Yahoo Finance historical daily index observations",
+  "tickers": [
+    "^GSPC",
+    "^GDAXI",
+    "^FCHI",
+    "^FTSE",
+    "^OMXSPI",
+    "^N225",
+    "^KS11",
+    "^HSI"
+  ],
+  "proxy": "100 * log(high / low) / sqrt(4 * log(2))",
+  "input_format": "vol_pct",
+  "train_end_exclusive": 2118,
+  "validation_end_exclusive": 2471,
+  "supporting_ohlc_retrieved_at_utc": "2026-09-30T09:34:18.583438+00:00",
+  "raw_ohlc_included": false,
+  "license_scope": "Third-party observations and derived panel are not licensed by the code MIT grant."
+}

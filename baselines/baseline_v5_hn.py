@@ -1,245 +1,252 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[4]:
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Aligned MSE-loss retest baselines for the eight-market volatility panel.
+
+HAR, VHAR and HAR-KS remain OLS on volatility. GNN-HAR, DCRNN-HAR and
+Pure-ST-Transformer minimize training-scale-standardized, node-balanced MSE
+on volatility. They share the union-calendar targets and chronological
+evaluation protocol of the main model; QLIKE is a reported metric only.
+
+DCRNN-HAR follows Chi, Gao and Wang (2026, Journal of Forecasting,
+doi:10.1002/for.70081): a sample-specific 22-day GFEVD graph, daily
+source masks, DCGRU encoder AND autoregressive decoder, nonoverlapping
+learnable HAR head, and horizon-length output. No teacher forcing and no
+future realized volatility enter the decoder. Future market-activity flags
+are used as a *known-calendar* input, as in that paper; this assumes closures
+are announced by the forecast origin. They are never used as volatility
+values. If unscheduled closures exist, this assumption needs separate audit.
+
+Run e.g.:
+ python baselines/baseline_v5_hn.py
+ python baselines/baseline_v5_hn.py --models HAR VHAR HAR-KS --horizons 1 5 22
+ python baselines/baseline_v5_hn.py --models DCRNN-HAR --horizons 1 --seeds 1
+
+This file loads the shared protocol from models/pga_trans_har.py;
+no training starts on import.
+"""
 from __future__ import annotations
 
 import argparse
-import copy
+import hashlib
+import importlib.util
 import json
 import math
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Dict, Sequence, Tuple
+from typing import Sequence
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.covariance import GraphicalLasso
+from torch import nn
+from torch.nn import functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-
-# 依赖于已经添加了 horizon 参数的 pga_trans_har_v5.py
-import pga_trans_har_v5_hn_fixed as protocol
+from sklearn.covariance import GraphicalLasso
 
 
-TRADITIONAL_MODELS = ("HAR", "VHAR", "HAR-KS")
-DEEP_MODELS = ("GNN-HAR", "DCRNN-HAR")
-ALL_MODELS = (*TRADITIONAL_MODELS, *DEEP_MODELS)
-
-
-# ---------------------------------------------------------------------------
-# Shared mask-aware HAR features
-# ---------------------------------------------------------------------------
-
-
-def panel_features(window_tuple):
-    X, Xm, Y, Ym, indices = window_tuple
-    overlap, valid = protocol.har_features_numpy(X, Xm)
-    values = X[..., 0]
-    active = Xm[..., 0] > 0.5
-    S = values.shape[1]
-    daily, daily_ok = protocol.numpy_last_valid(values, active)
-    previous_week, week_ok = protocol.numpy_masked_mean(
-        values, active, max(0, S - 5), S - 1
+HERE = Path(__file__).resolve().parent
+PROTOCOL_PATH = HERE.parent / "models" / "pga_trans_har.py"
+if not PROTOCOL_PATH.is_file():
+    raise FileNotFoundError(
+        f"Required shared forecast protocol not found: {PROTOCOL_PATH}"
     )
-    previous_month, month_ok = protocol.numpy_masked_mean(
-        values, active, 0, max(1, S - 5)
-    )
-    nonoverlap = np.stack([daily, previous_week, previous_month], axis=-1)
-    nonoverlap_valid = daily_ok & week_ok & month_ok
-    vhar = overlap.reshape(len(overlap), -1)
-    vhar_valid = valid.all(axis=1)
-    N = overlap.shape[1]
-    kitchen = np.zeros((len(overlap), N, N + 2), dtype=np.float32)
-    kitchen_valid = np.zeros((len(overlap), N), dtype=bool)
-    for node in range(N):
-        other_daily = np.delete(daily, node, axis=1)
-        other_ok = np.delete(daily_ok, node, axis=1).all(axis=1)
+spec = importlib.util.spec_from_file_location("pga_mse_retest_protocol", PROTOCOL_PATH)
+if spec is None or spec.loader is None:
+    raise ImportError(f"Cannot load {PROTOCOL_PATH}")
+protocol = importlib.util.module_from_spec(spec)
+import sys
+sys.modules[spec.name] = protocol
+spec.loader.exec_module(protocol)
+
+TRADITIONAL = ("HAR", "VHAR", "HAR-KS")
+DEEP = ("GNN-HAR", "DCRNN-HAR", "Pure-ST-Transformer")
+ALL = (*TRADITIONAL, *DEEP)
+FLOOR = float(protocol.QLIKE_VOL_FLOOR)
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_split_windows(values: np.ndarray, train_end: int, val_end: int,
+                       horizon: int, seq_len: int):
+    # Each target t has origin o=t-h. These first validation/test targets
+    # therefore have origins exactly at the preceding split's last day.
+    valid_start = train_end + horizon - 1
+    test_start = val_end + horizon - 1
+    train = protocol.make_windows(values, seq_len, train_end, seq_len, horizon)
+    valid = protocol.make_windows(values, valid_start, val_end, seq_len, horizon)
+    refit = protocol.make_windows(values, seq_len, val_end, seq_len, horizon)
+    test = protocol.make_windows(values, test_start, len(values), seq_len, horizon)
+    for label, windows, boundary in (
+        ("validation", valid, train_end), ("test", test, val_end)
+    ):
+        if len(windows[4]) == 0:
+            raise ValueError(f"No {label} samples at horizon {horizon}.")
+        if int(windows[4][0]) - horizon != boundary - 1:
+            raise AssertionError(f"{label} origin crosses the split boundary.")
+    return train, valid, refit, test
+
+
+def panel_features(windows):
+    X, Xm, Y, Ym, indices = windows
+    overlap, overlap_ok = protocol.har_features_numpy(X, Xm)
+    x, m = X[..., 0], Xm[..., 0] > 0.5
+    length, nodes = x.shape[1:]
+    daily, daily_ok = protocol.numpy_last_valid(x, m)
+    week, week_ok = protocol.numpy_masked_mean(x, m, length-5, length-1)
+    month, month_ok = protocol.numpy_masked_mean(x, m, 0, length-5)
+    nonoverlap = np.stack((daily, week, month), axis=-1)
+    nonoverlap_ok = daily_ok & week_ok & month_ok
+    kitchen = np.empty((len(X), nodes, nodes+2), dtype=np.float32)
+    kitchen_ok = np.empty((len(X), nodes), dtype=bool)
+    for node in range(nodes):
         kitchen[:, node] = np.concatenate(
-            [overlap[:, node], other_daily], axis=1
+            (overlap[:, node], np.delete(daily, node, axis=1)), axis=1
         )
-        kitchen_valid[:, node] = valid[:, node] & other_ok
+        kitchen_ok[:, node] = overlap_ok[:, node] & np.delete(
+            daily_ok, node, axis=1
+        ).all(axis=1)
     return {
-        "overlap": overlap,
-        "overlap_valid": valid,
+        "overlap": overlap, "overlap_ok": overlap_ok,
         "nonoverlap": nonoverlap.astype(np.float32),
-        "nonoverlap_valid": nonoverlap_valid,
-        "vhar": vhar.astype(np.float32),
-        "vhar_valid": vhar_valid,
-        "kitchen": kitchen,
-        "kitchen_valid": kitchen_valid,
-        "target": Y[..., 0],
-        "target_mask": Ym[..., 0] > 0.5,
-        "target_idx": indices,
+        "nonoverlap_ok": nonoverlap_ok,
+        "vhar": overlap.reshape(len(X), -1),
+        "vhar_ok": overlap_ok.all(axis=1),
+        "kitchen": kitchen, "kitchen_ok": kitchen_ok,
+        "y": Y[..., 0], "ym": Ym[..., 0] > 0.5,
+        "indices": indices,
     }
 
 
-def fit_ols(design: np.ndarray, target: np.ndarray) -> np.ndarray:
-    augmented = np.column_stack([np.ones(len(design)), design])
-    coefficients, *_ = np.linalg.lstsq(augmented, target, rcond=None)
-    return coefficients
+def ols_predict(design: np.ndarray, y: np.ndarray,
+                fit: np.ndarray, predict: np.ndarray) -> np.ndarray:
+    x_fit = np.column_stack((np.ones(int(fit.sum())), design[fit]))
+    beta, *_ = np.linalg.lstsq(x_fit, y[fit], rcond=None)
+    x_pred = np.column_stack((np.ones(int(predict.sum())), design[predict]))
+    return x_pred @ beta
 
 
-def predict_ols(design: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
-    return np.column_stack([np.ones(len(design)), design]) @ coefficients
-
-
-def run_traditional(
-    values: np.ndarray,
-    dates: pd.DatetimeIndex,
-    names: Sequence[str],
-    val_end: int,
-    seq_len: int,
-    outdir: Path,
-    selected_models: Sequence[str],
-    horizon: int,  # [新增]
-):
-    # 传入 horizon 防止未来数据泄露
-    all_windows = protocol.make_windows(values, seq_len, len(values), seq_len, horizon=horizon)
-    features = panel_features(all_windows)
-    train = features["target_idx"] < val_end
-    # At horizon h, the earliest leakage-free test target is val_end+h-1;
-    # its forecast origin is exactly val_end-1, the final refit observation.
-    test_target_start = val_end + horizon - 1
-    test = features["target_idx"] >= test_target_start
-    target = features["target"]
-    target_mask = features["target_mask"]
-    frames, metric_frames = [], []
-    N = len(names)
-
-    for model_name in TRADITIONAL_MODELS:
-        if model_name not in selected_models:
-            continue
-        prediction = np.full((int(test.sum()), N), np.nan, dtype=np.float64)
-        evaluation_mask = np.zeros_like(prediction, dtype=bool)
-        for node in range(N):
-            if model_name == "HAR":
-                design = features["overlap"][:, node]
-                feature_ok = features["overlap_valid"][:, node]
-            elif model_name == "VHAR":
-                design = features["vhar"]
-                feature_ok = features["vhar_valid"]
-            else:
-                design = features["kitchen"][:, node]
-                feature_ok = features["kitchen_valid"][:, node]
-            fit_rows = train & feature_ok & target_mask[:, node]
-            if fit_rows.sum() <= design.shape[1] + 10:
-                raise RuntimeError(f"Insufficient {model_name} rows for node {node}.")
-            coefficients = fit_ols(design[fit_rows], target[fit_rows, node])
-            test_ok = feature_ok[test]
-            prediction[test_ok, node] = predict_ols(
-                design[test][test_ok], coefficients
-            )
-            evaluation_mask[:, node] = target_mask[test, node] & test_ok
-
-        prediction = np.maximum(prediction, protocol.EPS)
-        arrays = {
-            "prediction": prediction,
-            "target": target[test],
-            "mask": evaluation_mask.astype(np.float32),
-            "target_idx": features["target_idx"][test],
-        }
-        frame = canonical_prediction_frame(
-            model_name, 0, arrays, dates, names, horizon=horizon
+def predict_traditional(model: str, windows, val_end: int,
+                        horizon: int) -> dict[str, np.ndarray]:
+    feat = panel_features(windows)
+    test = feat["indices"] >= val_end + horizon - 1
+    fit = feat["indices"] < val_end
+    n = feat["y"].shape[1]
+    prediction = np.full((int(test.sum()), n), np.nan)
+    eval_mask = np.zeros_like(prediction, dtype=bool)
+    for node in range(n):
+        if model == "HAR":
+            design, good = feat["overlap"][:, node], feat["overlap_ok"][:, node]
+        elif model == "VHAR":
+            design, good = feat["vhar"], feat["vhar_ok"]
+        else:
+            design, good = feat["kitchen"][:, node], feat["kitchen_ok"][:, node]
+        fit_node = fit & good & feat["ym"][:, node]
+        if fit_node.sum() < design.shape[1] + 10:
+            raise RuntimeError(f"Insufficient OLS observations: {model}, node {node}.")
+        pred_node = test & good
+        all_pred = np.full(len(test), np.nan)
+        all_pred[pred_node] = ols_predict(
+            design, feat["y"][:, node], fit_node, pred_node
         )
-        metrics = metric_table(model_name, 0, arrays, names, horizon=horizon)
-        model_dir = outdir / f"h{horizon}" / model_name / "seed0"
-        model_dir.mkdir(parents=True, exist_ok=True)
-        frame.to_csv(
-            model_dir / f"{model_name}_h{horizon}_seed0_predictions.csv", index=False
-        )
-        metrics.to_csv(model_dir / f"metrics_h{horizon}_seed0.csv", index=False)
-        frames.append(frame)
-        metric_frames.append(metrics)
-    return frames, metric_frames
+        prediction[:, node] = all_pred[test]
+        eval_mask[:, node] = feat["ym"][test, node] & good[test]
+    return {
+        "prediction": np.where(np.isfinite(prediction),
+                               np.maximum(prediction, FLOOR), np.nan),
+        "target": feat["y"][test].astype(np.float64),
+        "mask": eval_mask.astype(np.float32),
+        "target_idx": feat["indices"][test],
+    }
 
 
-# ---------------------------------------------------------------------------
-# Static graphs for the deep baselines
-# ---------------------------------------------------------------------------
-
-
-def complete_training_panel(values: np.ndarray) -> np.ndarray:
-    return protocol.causal_fill_window(values)
-
-
-def glasso_adjacency(values: np.ndarray, alpha: float) -> np.ndarray:
-    complete = complete_training_panel(values)
+def glasso_graph(values: np.ndarray, alpha: float) -> np.ndarray:
+    complete = protocol.causal_fill_window(values)
     z = (complete - complete.mean(axis=0)) / np.maximum(
         complete.std(axis=0, ddof=1), 1e-8
     )
     precision = GraphicalLasso(alpha=alpha, max_iter=2000).fit(z).precision_
     denominator = np.sqrt(np.outer(np.diag(precision), np.diag(precision)))
-    adjacency = np.divide(
-        np.abs(-precision),
-        denominator,
-        out=np.zeros_like(precision),
-        where=denominator > 0,
-    )
-    np.fill_diagonal(adjacency, 1.0)
-    adjacency /= np.maximum(adjacency.sum(axis=1, keepdims=True), 1e-12)
-    return adjacency.astype(np.float32)
+    graph = np.divide(np.abs(-precision), denominator,
+                      out=np.zeros_like(precision), where=denominator > 0)
+    np.fill_diagonal(graph, 1.0)
+    graph /= np.maximum(graph.sum(axis=1, keepdims=True), 1e-12)
+    return graph.astype(np.float32)
 
 
-def static_dy_adjacency(
-    values: np.ndarray, var_lag: int, ridge: float, horizon: int
-) -> np.ndarray:
-    return protocol.ridge_var_gfevd(
-        values, lags=var_lag, ridge=ridge, horizon=horizon
-    )
+def sample_dy_graphs(values: np.ndarray, target_indices: np.ndarray,
+                     horizon: int, seq_len: int, lags: int,
+                     ridge: float, dy_horizon: int,
+                     graph_cache: dict[int, np.ndarray]) -> np.ndarray:
+    graphs = []
+    for target_idx in target_indices:
+        origin_end = int(target_idx) - horizon + 1
+        if origin_end not in graph_cache:
+            history = values[origin_end-seq_len:origin_end]
+            if len(history) != seq_len:
+                raise AssertionError("Graph history does not end at forecast origin.")
+            graph = protocol.ridge_var_gfevd(
+                history, lags=lags, ridge=ridge, horizon=dy_horizon
+            )
+            if not np.isfinite(graph).all():
+                raise FloatingPointError(f"Nonfinite graph at origin {origin_end-1}.")
+            graph_cache[origin_end] = graph
+        graphs.append(graph_cache[origin_end])
+    return np.stack(graphs, axis=0).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Deep baseline datasets and models
-# ---------------------------------------------------------------------------
-
-
-class GNNDataset(Dataset):
-    def __init__(self, nonoverlap, overlap, target, target_mask, indices):
-        self.nonoverlap = torch.as_tensor(nonoverlap, dtype=torch.float32)
-        self.overlap = torch.as_tensor(overlap, dtype=torch.float32)
-        self.target = torch.as_tensor(target[..., None], dtype=torch.float32)
-        self.target_mask = torch.as_tensor(
-            target_mask[..., None], dtype=torch.float32
-        )
-        self.indices = torch.as_tensor(indices, dtype=torch.long)
+class ForecastSamples(Dataset):
+    def __init__(self, windows, values: np.ndarray, horizon: int,
+                 graphs: np.ndarray | None = None,
+                 decoder_calendar: str = "observed"):
+        X, Xm, Y, Ym, indices = windows
+        self.x = torch.from_numpy(X.astype(np.float32))
+        self.xm = torch.from_numpy(Xm.astype(np.float32))
+        self.y = torch.from_numpy(Y.astype(np.float32))
+        self.ym = torch.from_numpy(Ym.astype(np.float32))
+        self.indices = torch.from_numpy(indices.astype(np.int64))
+        self.graphs = None if graphs is None else torch.from_numpy(graphs)
+        if self.graphs is not None and len(self.graphs) != len(self.x):
+            raise ValueError("One dynamic graph is required per sample.")
+        if horizon > 1:
+            full_y, full_m = [], []
+            for target_idx in indices:
+                start = int(target_idx) - horizon + 1
+                future = values[start:int(target_idx)+1]
+                if len(future) != horizon:
+                    raise AssertionError("Incomplete decoder target sequence.")
+                full_m.append(np.isfinite(future).astype(np.float32))
+                full_y.append(np.nan_to_num(future, nan=0.0).astype(np.float32))
+            self.y_seq = torch.from_numpy(np.stack(full_y)[..., None])
+            self.ym_seq = torch.from_numpy(np.stack(full_m)[..., None])
+        else:
+            self.y_seq, self.ym_seq = self.y[:, None], self.ym[:, None]
+        if decoder_calendar == "observed":
+            self.calendar = self.ym_seq
+        elif decoder_calendar == "all_open":
+            self.calendar = torch.ones_like(self.ym_seq)
+        else:
+            raise ValueError(f"Unknown decoder calendar: {decoder_calendar}")
 
     def __len__(self):
-        return len(self.target)
+        return len(self.x)
 
-    def __getitem__(self, index):
-        return (
-            self.nonoverlap[index],
-            self.overlap[index],
-            self.target[index],
-            self.target_mask[index],
-            self.indices[index],
-        )
-
-
-class SequenceDataset(Dataset):
-    def __init__(self, window_tuple):
-        X, Xm, Y, Ym, indices = window_tuple
-        self.X = torch.as_tensor(X, dtype=torch.float32)
-        self.Xm = torch.as_tensor(Xm, dtype=torch.float32)
-        self.Y = torch.as_tensor(Y, dtype=torch.float32)
-        self.Ym = torch.as_tensor(Ym, dtype=torch.float32)
-        self.indices = torch.as_tensor(indices, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.Y)
-
-    def __getitem__(self, index):
-        return self.X[index], self.Xm[index], self.Y[index], self.Ym[index], self.indices[index]
+    def __getitem__(self, i):
+        graph = (self.graphs[i] if self.graphs is not None
+                 else torch.empty(0, dtype=torch.float32))
+        return (self.x[i], self.xm[i], self.y[i], self.ym[i],
+                self.y_seq[i], self.ym_seq[i], self.calendar[i],
+                self.indices[i], graph)
 
 
 class GraphConv(nn.Module):
@@ -248,7 +255,7 @@ class GraphConv(nn.Module):
         self.linear = nn.Linear(input_dim, output_dim)
 
     def forward(self, x, adjacency):
-        return torch.relu(self.linear(torch.einsum("ij,bjf->bif", adjacency, x)))
+        return F.relu(self.linear(torch.bmm(adjacency, x)))
 
 
 class GNNHAR(nn.Module):
@@ -259,660 +266,612 @@ class GNNHAR(nn.Module):
         self.gcn2 = GraphConv(hidden_dim, 1)
         self.har = nn.ModuleList([nn.Linear(3, 1) for _ in range(num_nodes)])
 
-    def forward(self, nonoverlap, overlap, adjacency):
-        graph = self.gcn2(self.gcn1(nonoverlap, adjacency), adjacency)
+    def forward(self, x, xm, graph):
+        overlap, nonoverlap = torch_har_features(x, xm)
+        source_active = xm[:, -1, :, 0]
+        adjacency = source_normalize(graph, source_active)
+        gnn = self.gcn2(self.gcn1(nonoverlap, adjacency), adjacency)
         har = torch.cat(
-            [self.har[node](overlap[:, node]) for node in range(self.num_nodes)],
-            dim=1,
+            [self.har[n](overlap[:, n]) for n in range(self.num_nodes)], dim=1
         )[..., None]
-        return F.softplus(har + graph).clamp_min(protocol.EPS)
+        return F.softplus(har + gnn).clamp_min(FLOOR)
 
 
-def masked_row_normalize(adjacency: torch.Tensor, source_active: torch.Tensor):
-    masked = adjacency[None, :, :] * source_active[:, None, :]
-    row_sum = masked.sum(dim=-1, keepdim=True)
-    fallback = torch.eye(
-        adjacency.size(0), device=adjacency.device, dtype=adjacency.dtype
-    )[None].expand(masked.size(0), -1, -1)
-    normalized = masked / row_sum.clamp_min(1e-12)
-    return torch.where(row_sum > 1e-12, normalized, fallback)
+def torch_har_features(x, xm):
+    # Overlapping HAR covariates: most recent valid, five-day and 22-day means.
+    daily = protocol.torch_last_valid(x, xm)
+    weekly = protocol.torch_masked_mean(x, xm, x.shape[1]-5, x.shape[1])
+    monthly = protocol.torch_masked_mean(x, xm, 0, x.shape[1])
+    overlap = torch.cat((daily, weekly, monthly), dim=-1)
+    # Graph/HAR nonoverlapping covariates: 1, preceding 4, preceding 17.
+    preweek = protocol.torch_masked_mean(x, xm, x.shape[1]-5, x.shape[1]-1)
+    premonth = protocol.torch_masked_mean(x, xm, 0, x.shape[1]-5)
+    nonoverlap = torch.cat((daily, preweek, premonth), dim=-1)
+    return overlap, nonoverlap
+
+
+def source_normalize(graph: torch.Tensor,
+                     source_active: torch.Tensor) -> torch.Tensor:
+    # graph[b,i,j]: node i receives from source j. Closed sources cannot send;
+    # closed destinations may still receive. An empty row remains zero, so an
+    # inactive node cannot leak through a diagonal fallback.
+    if graph.ndim == 2:
+        graph = graph[None].expand(source_active.size(0), -1, -1)
+    masked = graph * source_active[:, None, :]
+    degrees = masked.sum(dim=-1, keepdim=True)
+    return masked / degrees.clamp_min(1e-12)
 
 
 class DiffusionConv(nn.Module):
+    """Forward K-term diffusion: orders 0 through K-1 (Chi et al., Eq. 18)."""
     def __init__(self, input_dim: int, output_dim: int, steps: int):
         super().__init__()
+        if steps < 1:
+            raise ValueError("diffusion steps must be positive")
         self.steps = steps
-        self.linear = nn.Linear(input_dim * (2 * steps + 1), output_dim)
+        self.linear = nn.Linear(input_dim * steps, output_dim)
 
-    def forward(self, x, source_active, adjacency):
-        forward = masked_row_normalize(adjacency, source_active)
-        reverse = masked_row_normalize(adjacency.t(), source_active)
-        outputs, xf, xr = [x], x, x
-        for _ in range(self.steps):
-            xf = torch.bmm(forward, xf)
-            xr = torch.bmm(reverse, xr)
-            outputs.extend([xf, xr])
-        return self.linear(torch.cat(outputs, dim=-1))
+    def forward(self, x, walk):
+        terms = [x]
+        state = x
+        for _ in range(1,self.steps):
+            state = torch.bmm(walk, state)
+            terms.append(state)
+        return self.linear(torch.cat(terms, dim=-1))
 
 
 class DCGRUCell(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, diffusion_steps: int):
+    def __init__(self, input_dim: int, hidden_dim: int, steps: int):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.gates = DiffusionConv(
-            input_dim + hidden_dim, hidden_dim * 2, diffusion_steps
-        )
-        self.candidate = DiffusionConv(
-            input_dim + hidden_dim, hidden_dim, diffusion_steps
-        )
+        self.gates = DiffusionConv(input_dim+hidden_dim, 2*hidden_dim, steps)
+        self.candidate = DiffusionConv(input_dim+hidden_dim, hidden_dim, steps)
 
-    def forward(self, x, hidden, source_active, adjacency):
-        joined = torch.cat([x, hidden], dim=-1)
-        reset, update = torch.chunk(
-            torch.sigmoid(self.gates(joined, source_active, adjacency)), 2, dim=-1
-        )
-        candidate = torch.tanh(
-            self.candidate(
-                torch.cat([x, reset * hidden], dim=-1),
-                source_active,
-                adjacency,
-            )
-        )
-        return update * hidden + (1.0 - update) * candidate
+    def forward(self, x, hidden, walk):
+        reset, update = torch.sigmoid(self.gates(
+            torch.cat((x, hidden), dim=-1), walk
+        )).chunk(2, dim=-1)
+        candidate = torch.tanh(self.candidate(
+            torch.cat((x, reset*hidden), dim=-1), walk
+        ))
+        return update*hidden + (1.0-update)*candidate
 
 
 class DCRNNHAR(nn.Module):
-    def __init__(
-        self, num_nodes: int, seq_len: int, hidden_dim: int = 16, diffusion_steps: int = 2
-    ):
+    """Chi et al. encoder-decoder DCRNN-HAR with the aligned MSE objective."""
+    def __init__(self, num_nodes: int, horizon: int, hidden_dim: int = 16,
+                 diffusion_steps: int = 2):
         super().__init__()
         self.num_nodes = num_nodes
-        self.seq_len = seq_len
+        self.horizon = horizon
         self.hidden_dim = hidden_dim
-        self.cell = DCGRUCell(1, hidden_dim, diffusion_steps)
+        self.encoder = DCGRUCell(1, hidden_dim, diffusion_steps)
+        self.decoder = DCGRUCell(1, hidden_dim, diffusion_steps)
         self.projection = nn.Linear(hidden_dim, 1)
         self.har = nn.ModuleList([nn.Linear(3, 1) for _ in range(num_nodes)])
 
-    def forward(self, x, x_mask, adjacency):
-        hidden = torch.zeros(
-            x.size(0), self.num_nodes, self.hidden_dim, device=x.device
-        )
-        for time in range(self.seq_len):
-            hidden = self.cell(
-                x[:, time], hidden, x_mask[:, time, :, 0], adjacency
-            )
-        recurrent = self.projection(hidden)
-        daily = protocol.torch_last_valid(x, x_mask)
-        weekly = protocol.torch_masked_mean(x, x_mask, self.seq_len - 5, self.seq_len)
-        monthly = protocol.torch_masked_mean(x, x_mask, 0, self.seq_len)
-        features = torch.cat([daily, weekly, monthly], dim=-1)
+    def forward(self, x, xm, graph, future_calendar):
+        batch, seq_len, nodes, _ = x.shape
+        if nodes != self.num_nodes or future_calendar.shape[1] != self.horizon:
+            raise ValueError("DCRNN input/decoder dimensions do not match horizon.")
+        _, har_features = torch_har_features(x, xm)
         har = torch.cat(
-            [self.har[node](features[:, node]) for node in range(self.num_nodes)],
-            dim=1,
+            [self.har[n](har_features[:, n]) for n in range(nodes)], dim=1
         )[..., None]
-        return F.softplus(recurrent + har).clamp_min(protocol.EPS)
+        hidden = x.new_zeros(batch, nodes, self.hidden_dim)
+        for day in range(seq_len):
+            walk = source_normalize(graph, xm[:, day, :, 0])
+            hidden = self.encoder(x[:, day], hidden, walk)
+        decoder_input = x.new_zeros(batch, nodes, 1)  # y_hat_0 = 0
+        predictions = []
+        for step in range(self.horizon):
+            # Only scheduled activity, not future observed volatility, is seen.
+            active = future_calendar[:, step, :, 0]
+            walk = source_normalize(graph, active)
+            hidden = self.decoder(decoder_input, hidden, walk)
+            forecast = F.softplus(self.projection(hidden) + har).clamp_min(FLOOR)
+            predictions.append(forecast)
+            decoder_input = forecast * active[..., None]
+        return torch.stack(predictions, dim=1)
+
+
+class PureSpatialAttention(nn.Module):
+    def __init__(self, hidden_dim: int, dropout: float):
+        super().__init__()
+        self.q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.scale = hidden_dim ** -0.5
+
+    def forward(self, x, xm):
+        b, t, n, h = x.shape
+        q = self.q(x).reshape(b*t, n, h)
+        k = self.k(x).reshape(b*t, n, h)
+        v = self.v(x).reshape(b*t, n, h)
+        scores = torch.bmm(q, k.transpose(1, 2)) * self.scale
+        active = xm[..., 0].reshape(b*t, n)
+        weights = protocol.masked_softmax(scores,
+                                          active[:, None, :].expand(-1, n, -1))
+        return self.out(torch.bmm(self.dropout(weights), v).reshape(b,t,n,h))
+
+
+class PureTransformerBlock(nn.Module):
+    def __init__(self, hidden_dim: int, heads: int, dropout: float):
+        super().__init__()
+        self.temporal = protocol.MultiHeadTemporalAttention(
+            hidden_dim, heads, dropout
+        )
+        self.spatial = PureSpatialAttention(hidden_dim, dropout)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm3 = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, 4*hidden_dim), nn.GELU(),
+            nn.Dropout(dropout), nn.Linear(4*hidden_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, hidden, xm):
+        hidden = self.norm1(hidden + self.dropout(self.temporal(hidden, xm)))
+        hidden = self.norm2(hidden + self.dropout(self.spatial(hidden, xm)))
+        return self.norm3(hidden + self.ffn(hidden))
+
+
+class PureSTTransformer(nn.Module):
+    """Pure masked ST attention, with neither econometric graph nor HAR head."""
+    def __init__(self, num_nodes: int, seq_len: int,
+                 hidden_dim: int = 32, blocks: int = 2, heads: int = 4,
+                 dropout: float = 0.10):
+        super().__init__()
+        self.input_projection = nn.Linear(2, hidden_dim)
+        self.position = nn.Parameter(torch.randn(1,seq_len,1,hidden_dim)*0.02)
+        self.node = nn.Parameter(torch.randn(1,1,num_nodes,hidden_dim)*0.02)
+        self.blocks = nn.ModuleList(
+            [PureTransformerBlock(hidden_dim, heads, dropout) for _ in range(blocks)]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim,max(hidden_dim//2,8)), nn.GELU(),
+            nn.Linear(max(hidden_dim//2,8),1),
+        )
+
+    def forward(self, x, xm):
+        hidden = self.input_projection(torch.cat((x,xm),dim=-1))
+        hidden = hidden + self.position + self.node
+        for block in self.blocks:
+            hidden = block(hidden,xm)
+        return F.softplus(self.head(hidden[:,-1])).clamp_min(FLOOR)
 
 
 class NodeBalancedMSE(nn.Module):
+    """Original training-standardized, equal-node MSE on volatility."""
     def __init__(self, node_scale: np.ndarray):
         super().__init__()
-        self.register_buffer("scale", torch.as_tensor(node_scale).view(1, -1))
+        self.register_buffer("scale", torch.as_tensor(node_scale, dtype=torch.float32))
 
     def forward(self, prediction, target, mask):
-        error2 = (prediction[..., 0] - target[..., 0]) ** 2
-        active = mask[..., 0]
-        count = active.sum(dim=0)
-        valid = count > 0
-        node_mse = (error2 * active).sum(dim=0) / count.clamp_min(1.0)
-        standardized = node_mse / self.scale[0].square().clamp_min(1e-8)
+        active = mask
+        error2 = (prediction-target).square()
+        reduce_axes = tuple(range(active.ndim-2))
+        counts = active.sum(dim=reduce_axes)
+        node_loss = (
+            (error2*active).sum(dim=reduce_axes)
+            / counts.clamp_min(1.0)
+        )
+        valid = counts.squeeze(-1)>0
+        if not torch.any(valid):
+            raise RuntimeError("No observed targets in MSE batch.")
+        standardized = node_loss.squeeze(-1)/self.scale.square().clamp_min(1e-8)
         return standardized[valid].mean()
 
 
-def target_scales(values: np.ndarray, target_end: int, seq_len: int, horizon: int):
-    # [新增 horizon 参数传入]
-    windows = protocol.make_windows(values, seq_len, target_end, seq_len, horizon=horizon)
-    y, mask = windows[2][..., 0], windows[3][..., 0] > 0.5
-    scales = []
-    for node in range(y.shape[1]):
-        scales.append(max(float(np.std(y[mask[:, node], node], ddof=1)), 1e-3))
-    return np.asarray(scales, dtype=np.float32)
+def target_scales(values: np.ndarray, target_end: int, seq_len: int,
+                  horizon: int) -> np.ndarray:
+    windows = protocol.make_windows(values, seq_len, target_end, seq_len, horizon)
+    y, active = windows[2][..., 0], windows[3][..., 0] > 0.5
+    return np.asarray([
+        max(float(np.std(y[active[:, n], n], ddof=1)), 1e-3)
+        for n in range(y.shape[1])
+    ], dtype=np.float32)
 
 
-def loader(dataset, batch_size: int, shuffle: bool, seed: int):
-    generator = torch.Generator().manual_seed(seed)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=False,
-        num_workers=0,
-        generator=generator,
-    )
+def make_loader(data: Dataset, batch_size: int, shuffle: bool,
+                seed: int) -> DataLoader:
+    return DataLoader(data, batch_size=batch_size, shuffle=shuffle,
+                      drop_last=False, num_workers=0,
+                      generator=torch.Generator().manual_seed(seed))
 
 
-def run_forward(model, batch, adjacency, model_name, device):
-    if model_name == "GNN-HAR":
-        nonoverlap, overlap, target, mask, indices = batch
-        prediction = model(
-            nonoverlap.to(device), overlap.to(device), adjacency
-        )
+def make_model(name: str, nodes: int, horizon: int, args, device):
+    if name == "GNN-HAR":
+        model = GNNHAR(nodes, args.gnn_hidden)
+    elif name == "DCRNN-HAR":
+        model = DCRNNHAR(nodes, horizon, args.dcrnn_hidden,
+                         args.diffusion_steps)
     else:
-        x, x_mask, target, mask, indices = batch
-        prediction = model(x.to(device), x_mask.to(device), adjacency)
-    return prediction, target.to(device), mask.to(device), indices
-
-
-def train_epoch(model, data_loader, objective, optimizer, adjacency, model_name, device):
-    model.train()
-    total, batches = 0.0, 0
-    for batch in data_loader:
-        optimizer.zero_grad(set_to_none=True)
-        prediction, target, mask, _ = run_forward(
-            model, batch, adjacency, model_name, device
-        )
-        loss = objective(prediction, target, mask)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total += float(loss.item())
-        batches += 1
-    return total / max(batches, 1)
-
-
-def evaluate_objective(model, data_loader, objective, adjacency, model_name, device):
-    model.eval()
-    predictions, targets, masks = [], [], []
-    with torch.no_grad():
-        for batch in data_loader:
-            prediction, target, mask, _ = run_forward(
-                model, batch, adjacency, model_name, device
-            )
-            predictions.append(prediction)
-            targets.append(target)
-            masks.append(mask)
-    return float(
-        objective(
-            torch.cat(predictions), torch.cat(targets), torch.cat(masks)
-        ).item()
-    )
-
-
-def select_epoch(
-    model,
-    train_loader,
-    val_loader,
-    objective,
-    adjacency,
-    model_name,
-    device,
-    max_epochs,
-    patience,
-    learning_rate,
-):
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max_epochs, eta_min=1e-6
-    )
-    best_value, best_epoch, wait, best_state = float("inf"), 0, 0, None
-    history = []
-    for epoch in range(1, max_epochs + 1):
-        train_value = train_epoch(
-            model, train_loader, objective, optimizer, adjacency, model_name, device
-        )
-        val_value = evaluate_objective(
-            model, val_loader, objective, adjacency, model_name, device
-        )
-        history.append(
-            {
-                "epoch": epoch,
-                "train_node_balanced_mse": train_value,
-                "val_node_balanced_mse": val_value,
-                "learning_rate": optimizer.param_groups[0]["lr"],
-            }
-        )
-        if val_value < best_value - 1e-8:
-            best_value, best_epoch, wait = val_value, epoch, 0
-            best_state = copy.deepcopy(model.state_dict())
-        else:
-            wait += 1
-        scheduler.step()
-        if wait >= patience:
-            break
-    if best_state is None:
-        raise RuntimeError("No validation checkpoint was produced.")
-    model.load_state_dict(best_state)
-    return model, best_epoch, pd.DataFrame(history)
-
-
-def refit(model, data_loader, objective, adjacency, model_name, device, epochs, lr):
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(epochs, 1), eta_min=1e-6
-    )
-    final_value = float("nan")
-    for _ in range(epochs):
-        final_value = train_epoch(
-            model, data_loader, objective, optimizer, adjacency, model_name, device
-        )
-        scheduler.step()
-    return model, final_value
-
-
-def predict(model, data_loader, adjacency, model_name, device):
-    model.eval()
-    predictions, targets, masks, indices = [], [], [], []
-    with torch.no_grad():
-        for batch in data_loader:
-            prediction, target, mask, index = run_forward(
-                model, batch, adjacency, model_name, device
-            )
-            predictions.append(prediction.cpu().numpy()[..., 0])
-            targets.append(target.cpu().numpy()[..., 0])
-            masks.append(mask.cpu().numpy()[..., 0])
-            indices.append(index.numpy())
-    return {
-        "prediction": np.concatenate(predictions),
-        "target": np.concatenate(targets),
-        "mask": np.concatenate(masks),
-        "target_idx": np.concatenate(indices),
-    }
-
-
-def build_gnn_dataset(window_tuple):
-    features = panel_features(window_tuple)
-    return GNNDataset(
-        features["nonoverlap"],
-        features["overlap"],
-        features["target"],
-        features["target_mask"],
-        features["target_idx"],
-    )
-
-
-def construct_model(model_name, num_nodes, seq_len, seed, device):
-    protocol.set_seed(seed)
-    if model_name == "GNN-HAR":
-        model = GNNHAR(num_nodes)
-    else:
-        model = DCRNNHAR(num_nodes, seq_len)
+        model = PureSTTransformer(nodes, args.seq_len, args.hidden_dim,
+                                  args.blocks, args.heads, args.dropout)
     return model.to(device)
 
 
-# ---------------------------------------------------------------------------
-# Export helpers
-# ---------------------------------------------------------------------------
+def forward_batch(model, model_name, batch, static_graph, device):
+    x, xm, y, ym, yseq, ymseq, calendar, indices, sample_graph = batch
+    x, xm = x.to(device), xm.to(device)
+    y, ym = y.to(device), ym.to(device)
+    if model_name == "DCRNN-HAR":
+        graph = sample_graph.to(device)
+        sequence = model(x, xm, graph, calendar.to(device))
+        return sequence, yseq.to(device), ymseq.to(device), indices
+    if model_name == "GNN-HAR":
+        pred = model(x, xm, static_graph)
+    else:
+        pred = model(x, xm)
+    return pred, y, ym, indices
 
 
-def canonical_prediction_frame(model, seed, arrays, dates, names, horizon):
+def epoch_train(model, model_name, data_loader, graph, optimizer,
+                objective, device, grad_clip: float) -> float:
+    model.train()
+    total, count = 0.0, 0
+    for batch in data_loader:
+        optimizer.zero_grad(set_to_none=True)
+        p,y,m,_ = forward_batch(model,model_name,batch,graph,device)
+        loss = objective(p,y,m)
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training MSE.")
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(),grad_clip)
+        optimizer.step()
+        total += float(loss.detach().cpu())
+        count += 1
+    return total/max(count,1)
+
+
+@torch.no_grad()
+def collect(model, model_name, data_loader, graph, device):
+    model.eval()
+    predictions, targets, masks, indices = [], [], [], []
+    for batch in data_loader:
+        p,y,m,idx = forward_batch(model,model_name,batch,graph,device)
+        if model_name == "DCRNN-HAR":
+            p,y,m = p[:,-1],y[:,-1],m[:,-1]
+        predictions.append(p.cpu().numpy()[...,0])
+        targets.append(y.cpu().numpy()[...,0])
+        masks.append(m.cpu().numpy()[...,0])
+        indices.append(idx.numpy())
+    return {"prediction":np.concatenate(predictions),
+            "target":np.concatenate(targets),
+            "mask":np.concatenate(masks),
+            "target_idx":np.concatenate(indices)}
+
+
+def panel_mse_numpy(arrays, node_scale: np.ndarray) -> float:
+    losses = []
+    for node in range(arrays["target"].shape[1]):
+        good = arrays["mask"][:,node]>0.5
+        if good.any():
+            losses.append(float(np.mean((
+                arrays["target"][good,node] - arrays["prediction"][good,node]
+            )**2)/max(float(node_scale[node])**2, 1e-8)))
+    if not losses:
+        raise RuntimeError("No active targets in validation set.")
+    return float(np.mean(losses))
+
+
+def fit_select(model, name, train_data, val_data, static_graph, args,
+               device, seed, lr, node_scale):
+    objective = NodeBalancedMSE(node_scale).to(device)
+    optimizer = AdamW(model.parameters(),lr=lr,weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,T_max=args.max_epochs,eta_min=args.lr_min
+    )
+    train_loader = make_loader(train_data,args.batch_size,True,seed)
+    val_loader = make_loader(val_data,args.batch_size,False,seed)
+    best, best_epoch, stale, history = math.inf, 0, 0, []
+    for epoch in range(1,args.max_epochs+1):
+        train_loss = epoch_train(model,name,train_loader,static_graph,
+                                 optimizer,objective,device,args.grad_clip)
+        val_loss = panel_mse_numpy(collect(
+            model,name,val_loader,static_graph,device
+        ), node_scale)
+        history.append({"epoch":epoch,"train_standardized_mse":train_loss,
+                        "val_horizon_standardized_mse":val_loss,
+                        "learning_rate":optimizer.param_groups[0]["lr"]})
+        if val_loss<best-1e-9:
+            best,best_epoch,stale = val_loss,epoch,0
+        else:
+            stale += 1
+        scheduler.step()
+        if stale>=args.patience:
+            break
+    if best_epoch<1:
+        raise RuntimeError("Validation did not select an epoch.")
+    return best_epoch,pd.DataFrame(history)
+
+
+def refit_fixed_epochs(model, name, refit_data, static_graph, args,
+                       device, seed, lr, epochs, node_scale):
+    optimizer = AdamW(model.parameters(),lr=lr,weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,T_max=epochs,eta_min=args.lr_min
+    )
+    objective = NodeBalancedMSE(node_scale).to(device)
+    train_loader = make_loader(refit_data,args.batch_size,True,seed)
+    loss = float("nan")
+    for _ in range(epochs):
+        loss = epoch_train(model,name,train_loader,static_graph,
+                           optimizer,objective,device,args.grad_clip)
+        scheduler.step()
+    return loss
+
+
+def prediction_frame(name, seed, horizon, arrays, dates, names):
     rows = []
-    for row, target_idx in enumerate(arrays["target_idx"]):
-        for node, name in enumerate(names):
-            active = bool(arrays["mask"][row, node] > 0.5)
-            rows.append(
-                {
-                    "model": model,
-                    "horizon": int(horizon),
-                    "seed": int(seed),
-                    "target_idx": int(target_idx),
-                    "target_date": pd.Timestamp(dates[target_idx]).date().isoformat(),
-                    "origin_idx": int(target_idx - horizon),
-                    "origin_date": pd.Timestamp(dates[target_idx - horizon]).date().isoformat(),
-                    "node": node,
-                    "node_name": name,
-                    "y_sqrt_rv_pct": float(arrays["target"][row, node]) if active else np.nan,
-                    "pred_sqrt_rv_pct": float(arrays["prediction"][row, node]),
-                    "active": int(active),
-                }
-            )
+    for i,target_idx in enumerate(arrays["target_idx"]):
+        target_idx = int(target_idx)
+        origin_idx = target_idx-horizon
+        for node,node_name in enumerate(names):
+            active = bool(arrays["mask"][i,node]>0.5)
+            rows.append({
+                "model":name,"horizon":horizon,"seed":seed,
+                "target_idx":target_idx,
+                "target_date":pd.Timestamp(dates[target_idx]).date().isoformat(),
+                "origin_idx":origin_idx,
+                "origin_date":pd.Timestamp(dates[origin_idx]).date().isoformat(),
+                "node":node,"node_name":node_name,
+                "y_sqrt_rv_pct":float(arrays["target"][i,node]) if active else np.nan,
+                "pred_sqrt_rv_pct":float(arrays["prediction"][i,node])
+                                   if np.isfinite(arrays["prediction"][i,node]) else np.nan,
+                "active":int(active),
+            })
     return pd.DataFrame(rows)
 
 
-def metric_table(model, seed, arrays, names, horizon):
+def metric_table(name, seed, horizon, arrays, names):
     rows = []
-    for node, name in enumerate(names):
-        active = arrays["mask"][:, node] > 0.5
-        error = arrays["prediction"][active, node] - arrays["target"][active, node]
-        rows.append(
-            {
-                "model": model,
-                "horizon": int(horizon),
-                "seed": int(seed),
-                "node": node,
-                "node_name": name,
-                "n_active": int(active.sum()),
-                "MSE": float(np.mean(error ** 2)),
-                "MAE": float(np.mean(np.abs(error))),
-            }
-        )
+    for node,node_name in enumerate(names):
+        good = arrays["mask"][:,node]>0.5
+        good &= np.isfinite(arrays["prediction"][:,node])
+        y = arrays["target"][good,node]
+        p = arrays["prediction"][good,node]
+        if len(y)==0:
+            raise RuntimeError(f"No evaluable targets: {name} {node_name}.")
+        rows.append({
+            "model":name,"horizon":horizon,"seed":seed,
+            "node":node,"node_name":node_name,"n_active":len(y),
+            "MSE":float(np.mean((p-y)**2)),
+            "MAE":float(np.mean(np.abs(p-y))),
+            "QLIKE":float(np.mean(protocol.qlike_from_volatility_numpy(y,p))),
+        })
     return pd.DataFrame(rows)
 
 
 def summarize(metrics):
-    return (
-        metrics.groupby(["model", "horizon", "node", "node_name"], as_index=False)
-        .agg(
-            n_seeds=("seed", "nunique"),
-            n_active=("n_active", "min"),
-            MSE_mean=("MSE", "mean"),
-            MSE_std=("MSE", "std"),
-            MAE_mean=("MAE", "mean"),
-            MAE_std=("MAE", "std"),
-        )
-        .fillna({"MSE_std": 0.0, "MAE_std": 0.0})
-    )
-
-
-def run_deep_model_seed(
-    model_name,
-    seed,
-    values,
-    dates,
-    names,
-    train_end,
-    val_end,
-    config,
-    graph_config,
-    device,
-    outdir,
-    horizon,  # [新增]
-):
-    # 全部透传 horizon 参数
-    validation_target_start = train_end + horizon - 1
-    test_target_start = val_end + horizon - 1
-    train_windows = protocol.make_windows(values, config.seq_len, train_end, config.seq_len, horizon=horizon)
-    val_windows = protocol.make_windows(
-        values, validation_target_start, val_end, config.seq_len, horizon=horizon
-    )
-    refit_windows = protocol.make_windows(values, config.seq_len, val_end, config.seq_len, horizon=horizon)
-    test_windows = protocol.make_windows(
-        values, test_target_start, len(values), config.seq_len, horizon=horizon
-    )
-    if int(val_windows[4][0]) - horizon != train_end - 1:
-        raise AssertionError("Validation forecast origin is not split-safe.")
-    if int(test_windows[4][0]) - horizon != val_end - 1:
-        raise AssertionError("Test forecast origin is not split-safe.")
-    
-    dataset_factory = build_gnn_dataset if model_name == "GNN-HAR" else SequenceDataset
-    train_data = dataset_factory(train_windows)
-    val_data = dataset_factory(val_windows)
-    refit_data = dataset_factory(refit_windows)
-    test_data = dataset_factory(test_windows)
-    
-    scale_dev = target_scales(values, train_end, config.seq_len, horizon=horizon)
-    scale_refit = target_scales(values, val_end, config.seq_len, horizon=horizon)
-    objective_dev = NodeBalancedMSE(scale_dev).to(device)
-    objective_refit = NodeBalancedMSE(scale_refit).to(device)
-
-    # 静态图只在训练集上构建，不受 horizon 影响（它反映的是整体相关性），原样保留即可
-    graph_function = glasso_adjacency if model_name == "GNN-HAR" else static_dy_adjacency
-    if model_name == "GNN-HAR":
-        graph_dev_np = graph_function(values[:train_end], graph_config.glasso_alpha)
-        graph_refit_np = graph_function(values[:val_end], graph_config.glasso_alpha)
-    else:
-        graph_dev_np = graph_function(
-            values[:train_end], graph_config.var_lag, graph_config.var_ridge, graph_config.dy_horizon
-        )
-        graph_refit_np = graph_function(
-            values[:val_end], graph_config.var_lag, graph_config.var_ridge, graph_config.dy_horizon
-        )
-    graph_dev = torch.as_tensor(graph_dev_np, dtype=torch.float32, device=device)
-    graph_refit = torch.as_tensor(graph_refit_np, dtype=torch.float32, device=device)
-
-    lr = config.gnn_lr if model_name == "GNN-HAR" else config.dcrnn_lr
-    model = construct_model(model_name, len(names), config.seq_len, seed, device)
-    model, selected_epoch, history = select_epoch(
-        model,
-        loader(train_data, config.batch_size, True, seed),
-        loader(val_data, config.batch_size, False, seed),
-        objective_dev,
-        graph_dev,
-        model_name,
-        device,
-        config.max_epochs,
-        config.patience,
-        lr,
-    )
-    history.insert(0, "model", model_name)
-    history.insert(1, "seed", seed)
-    history["selected_epoch"] = selected_epoch
-
-    final_model = construct_model(model_name, len(names), config.seq_len, seed, device)
-    final_model, final_train_value = refit(
-        final_model,
-        loader(refit_data, config.batch_size, True, seed),
-        objective_refit,
-        graph_refit,
-        model_name,
-        device,
-        selected_epoch,
-        lr,
-    )
-    arrays = predict(
-        final_model,
-        loader(test_data, config.batch_size, False, seed),
-        graph_refit,
-        model_name,
-        device,
-    )
-    frame = canonical_prediction_frame(model_name, seed, arrays, dates, names, horizon=horizon)
-    metrics = metric_table(model_name, seed, arrays, names, horizon=horizon)
-    metrics["selected_epoch"] = selected_epoch
-    metrics["final_train_objective"] = final_train_value
-    
-    model_dir = outdir / f"h{horizon}" / model_name / f"seed{seed}"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(
-        model_dir / f"{model_name}_h{horizon}_seed{seed}_predictions.csv", index=False
-    )
-    metrics.to_csv(model_dir / f"metrics_h{horizon}_seed{seed}.csv", index=False)
-    torch.save(
-        {
-            "model_state_dict": final_model.state_dict(),
-            "selected_epoch": selected_epoch,
-            "seed": seed,
-            "model": model_name,
-        },
-        model_dir / f"model_h{horizon}_seed{seed}.pt",
-    )
-    inventory = {
-        "model": model_name,
-        "seed": seed,
-        "selected_epoch": selected_epoch,
-        "parameter_count": sum(
-            p.numel() for p in final_model.parameters() if p.requires_grad
-        ),
-    }
-    return frame, metrics, history, inventory
+    result = metrics.groupby(
+        ["model","horizon","node","node_name"],as_index=False
+    ).agg(n_seeds=("seed","nunique"),n_active=("n_active","min"),
+          MSE_mean=("MSE","mean"),MSE_std=("MSE","std"),
+          MAE_mean=("MAE","mean"),MAE_std=("MAE","std"),
+          QLIKE_mean=("QLIKE","mean"),QLIKE_std=("QLIKE","std"))
+    return result.fillna({"MSE_std":0.0,"MAE_std":0.0,"QLIKE_std":0.0})
 
 
 @dataclass
-class DeepConfig:
-    seq_len: int = 22
-    batch_size: int = 64
-    max_epochs: int = 100
-    patience: int = 15
-    gnn_lr: float = 0.002
-    dcrnn_lr: float = 0.001
-
-
-@dataclass
-class GraphConfig:
+class GraphSettings:
     glasso_alpha: float = 0.08
-    var_lag: int = 2
-    var_ridge: float = 5.0
-    dy_horizon: int = 22
+    dcrnn_var_lag: int = 1
+    dcrnn_var_ridge: float = 0.0
+    dcrnn_dy_horizon: int = 22
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="df_union_sqrt.csv")
-    parser.add_argument("--input-format", choices=["sqrt_rv", "rv"], default="sqrt_rv")
-    parser.add_argument("--outdir", default="baseline_results_v5")
-    parser.add_argument("--models", nargs="+", choices=ALL_MODELS, default=list(ALL_MODELS))
-    parser.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 22]) # [新增 horizons 列表]
-    parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3, 4, 5])
-    parser.add_argument("--train-ratio", type=float, default=0.60)
-    parser.add_argument("--val-ratio", type=float, default=0.10)
-    parser.add_argument("--seq-len", type=int, default=22)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--max-epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=15)
-    parser.add_argument("--gnn-lr", type=float, default=0.002)
-    parser.add_argument("--dcrnn-lr", type=float, default=0.001)
-    parser.add_argument("--glasso-alpha", type=float, default=0.08)
-    parser.add_argument("--var-lag", type=int, default=2)
-    parser.add_argument("--var-ridge", type=float, default=5.0)
-    parser.add_argument("--dy-horizon", type=int, default=22)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-    args, unknown = parser.parse_known_args()
-    return args
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data",type=Path,default=(
+        HERE.parent/"data"/"df_union_sqrt.csv"))
+    parser.add_argument("--input-format",choices=["vol_pct","sqrt_rv","rv"],
+                        default="vol_pct")
+    parser.add_argument("--outdir",type=Path,default=HERE.parent/"results"/"baselines")
+    parser.add_argument("--models",nargs="+",choices=ALL,default=list(ALL))
+    parser.add_argument("--horizons",nargs="+",type=int,default=[1,5,22])
+    parser.add_argument("--seeds",nargs="+",type=int,default=[1,2,3,4,5])
+    parser.add_argument("--train-ratio",type=float,default=0.60)
+    parser.add_argument("--val-ratio",type=float,default=0.10)
+    parser.add_argument("--seq-len",type=int,default=22)
+    parser.add_argument("--batch-size",type=int,default=64)
+    parser.add_argument("--max-epochs",type=int,default=150)
+    parser.add_argument("--patience",type=int,default=20)
+    parser.add_argument("--gnn-lr",type=float,default=0.002)
+    parser.add_argument("--dcrnn-lr",type=float,default=0.001)
+    parser.add_argument("--transformer-lr",type=float,default=5e-4)
+    parser.add_argument("--lr-min",type=float,default=1e-6)
+    parser.add_argument("--weight-decay",type=float,default=1e-4)
+    parser.add_argument("--grad-clip",type=float,default=1.0)
+    parser.add_argument("--gnn-hidden",type=int,default=16)
+    parser.add_argument("--dcrnn-hidden",type=int,default=16)
+    parser.add_argument("--diffusion-steps",type=int,default=2)
+    parser.add_argument("--hidden-dim",type=int,default=32)
+    parser.add_argument("--blocks",type=int,default=2)
+    parser.add_argument("--heads",type=int,default=4)
+    parser.add_argument("--dropout",type=float,default=0.10)
+    parser.add_argument("--glasso-alpha",type=float,default=0.08)
+    parser.add_argument("--dcrnn-var-lag",type=int,default=1)
+    parser.add_argument("--dcrnn-var-ridge",type=float,default=0.0)
+    parser.add_argument("--dcrnn-dy-horizon",type=int,default=22)
+    parser.add_argument("--dcrnn-decoder-calendar",
+                        choices=["observed","all_open"],default="observed",
+                        help=("observed reproduces the paper's future activity mask "
+                              "and assumes these closures were known at origin; "
+                              "all_open avoids that assumption as a robustness run"))
+    parser.add_argument("--device",choices=["auto","cpu","cuda"],default="auto")
+    return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    args.horizons = sorted(set(args.horizons))
-    if not args.horizons or any(horizon < 1 for horizon in args.horizons):
-        raise ValueError("--horizons must contain positive integers.")
-    if args.seq_len != 22:
-        raise ValueError("Baseline V5 fixes seq_len=22.")
-        
-    panel = protocol.load_panel(args.data, args.input_format)
-    values, dates, names = panel.values, panel.dates, panel.names
-    train_end, val_end = protocol.fixed_split(
-        len(values), args.train_ratio, args.val_ratio
+    if args.seq_len!=22:
+        raise ValueError("This benchmark requires the same 22-day lookback as PGA.")
+    if not args.data.is_file():
+        raise FileNotFoundError(f"Input panel does not exist: {args.data}")
+    horizons = sorted(set(args.horizons))
+    if any(h<1 for h in horizons) or not horizons:
+        raise ValueError("Horizons must be positive.")
+    seeds = list(dict.fromkeys(args.seeds))
+    if not seeds or any(seed<0 for seed in seeds):
+        raise ValueError("Provide one or more nonnegative seeds.")
+    panel = protocol.load_panel(args.data,args.input_format)
+    values,dates,names = panel.values,panel.dates,panel.names
+    train_end,val_end = protocol.fixed_split(
+        len(values),args.train_ratio,args.val_ratio
     )
+    if val_end+max(horizons)-1>=len(values):
+        raise ValueError("Not enough test dates for the requested horizons.")
     device = protocol.choose_device(args.device)
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    
-    deep_config = DeepConfig(
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        max_epochs=args.max_epochs,
-        patience=args.patience,
-        gnn_lr=args.gnn_lr,
-        dcrnn_lr=args.dcrnn_lr,
-    )
-    graph_config = GraphConfig(
-        glasso_alpha=args.glasso_alpha,
-        var_lag=args.var_lag,
-        var_ridge=args.var_ridge,
-        dy_horizon=args.dy_horizon,
-    )
-
-    frames, metric_frames, histories = [], [], []
-    inventory_dict = {}
-
-    # 外层套入 Horizon 循环
-    for h in args.horizons:
-        print(f"\n{'='*60}")
-        print(f"=== Starting Baseline Horizon: h = {h} ===")
-        print(f"{'='*60}")
-
-        # 1. 跑传统的计量基线模型 (HAR, VHAR, HAR-KS)
-        traditional_frames, traditional_metrics = run_traditional(
-            values, dates, names, val_end, args.seq_len, outdir, args.models, horizon=h
+    if "qlike" in args.outdir.name.lower():
+        raise ValueError("Refusing to write MSE results into a QLIKE-named output directory.")
+    args.outdir.mkdir(parents=True,exist_ok=True)
+    all_metrics,all_predictions,all_histories,inventory = [],[],[],[]
+    graph_settings = GraphSettings(args.glasso_alpha,args.dcrnn_var_lag,
+                                   args.dcrnn_var_ridge,args.dcrnn_dy_horizon)
+    graph_cache: dict[int,np.ndarray] = {}
+    for horizon in horizons:
+        print(f"Horizon h={horizon}",flush=True)
+        train_w,val_w,refit_w,test_w = make_split_windows(
+            values,train_end,val_end,horizon,args.seq_len
         )
-        frames.extend(traditional_frames)
-        metric_frames.extend(traditional_metrics)
-        
-        # 计入库存 (库存信息对模型本身是通用的，跟 horizon 无关)
-        for model_name in TRADITIONAL_MODELS:
-            if model_name in args.models:
-                inventory_dict[model_name] = {
-                    "model": model_name,
-                    "seed": 0,
-                    "selected_epoch": 0,
-                    "parameter_count": 0,
-                }
-
-        # 2. 跑深度基线模型 (GNN-HAR, DCRNN-HAR)
-        for model_name in DEEP_MODELS:
-            if model_name not in args.models:
+        for name in TRADITIONAL:
+            if name not in args.models:
                 continue
-            for seed in args.seeds:
-                print(f"\n--- [h={h}] {model_name}, seed {seed} ---", flush=True)
-                frame, metrics, history, item = run_deep_model_seed(
-                    model_name,
-                    seed,
-                    values,
-                    dates,
-                    names,
-                    train_end,
-                    val_end,
-                    deep_config,
-                    graph_config,
-                    device,
-                    outdir,
-                    horizon=h,
+            windows = protocol.make_windows(
+                values,args.seq_len,len(values),args.seq_len,horizon
+            )
+            arrays = predict_traditional(name,windows,val_end,horizon)
+            frame = prediction_frame(name,0,horizon,arrays,dates,names)
+            metrics = metric_table(name,0,horizon,arrays,names)
+            dest = args.outdir/f"h{horizon}"/name/"seed0"
+            dest.mkdir(parents=True,exist_ok=True)
+            frame.to_csv(dest/"predictions.csv",index=False)
+            metrics.to_csv(dest/"metrics.csv",index=False)
+            all_predictions.append(frame)
+            all_metrics.append(metrics)
+            inventory.append({"model":name,"horizon":horizon,"seed":0,
+                              "fit":"OLS_volatility"})
+        for name in DEEP:
+            if name not in args.models:
+                continue
+            print(f"  {name}: preparing origin-aligned datasets",flush=True)
+            graph_dev = graph_refit = None
+            if name=="GNN-HAR":
+                graph_dev = torch.from_numpy(glasso_graph(
+                    values[:train_end],args.glasso_alpha
+                )).to(device)
+                graph_refit = torch.from_numpy(glasso_graph(
+                    values[:val_end],args.glasso_alpha
+                )).to(device)
+            def make_dataset(windows):
+                graph = None
+                if name=="DCRNN-HAR":
+                    graph = sample_dy_graphs(
+                        values,windows[4],horizon,args.seq_len,
+                        args.dcrnn_var_lag,args.dcrnn_var_ridge,
+                        args.dcrnn_dy_horizon,graph_cache
+                    )
+                return ForecastSamples(windows,values,horizon,graph,
+                                       args.dcrnn_decoder_calendar)
+            train_data = make_dataset(train_w)
+            val_data = make_dataset(val_w)
+            refit_data = make_dataset(refit_w)
+            test_data = make_dataset(test_w)
+            scale_dev = target_scales(values, train_end, args.seq_len, horizon)
+            scale_refit = target_scales(values, val_end, args.seq_len, horizon)
+            lr = (args.gnn_lr if name=="GNN-HAR" else
+                  args.dcrnn_lr if name=="DCRNN-HAR" else
+                  args.transformer_lr)
+            for seed in seeds:
+                print(f"    seed={seed}: select then refit",flush=True)
+                seed_everything(seed)
+                model = make_model(name,len(names),horizon,args,device)
+                selected_epoch,history = fit_select(
+                    model,name,train_data,val_data,graph_dev,args,device,seed,lr,
+                    scale_dev
                 )
-                frames.append(frame)
-                metric_frames.append(metrics)
-                histories.append(history)
-                inventory_dict[f"{model_name}_seed{seed}"] = item
-
-    if not frames:
-        raise RuntimeError("No baseline models were selected.")
-        
-    metrics = pd.concat(metric_frames, ignore_index=True)
-    predictions = pd.concat(frames, ignore_index=True)
-    summary = summarize(metrics)
-    inventory = list(inventory_dict.values())
-    
-    metrics.to_csv(outdir / "all_seed_metrics_ALL_HORIZONS.csv", index=False)
-    predictions.to_csv(outdir / "all_seed_predictions_ALL_HORIZONS.csv", index=False)
-    summary.to_csv(outdir / "summary_mean_std_ALL_HORIZONS.csv", index=False)
-    pd.DataFrame(inventory).to_csv(outdir / "model_inventory.csv", index=False)
-    
-    if histories:
-        pd.concat(histories, ignore_index=True).to_csv(
-            outdir / "validation_history_ALL_HORIZONS.csv", index=False
+                del model
+                seed_everything(seed)
+                model = make_model(name,len(names),horizon,args,device)
+                final_loss = refit_fixed_epochs(
+                    model,name,refit_data,graph_refit,args,device,seed,lr,
+                    selected_epoch,scale_refit
+                )
+                arrays = collect(model,name,make_loader(
+                    test_data,args.batch_size,False,seed
+                ),graph_refit,device)
+                frame = prediction_frame(name,seed,horizon,arrays,dates,names)
+                metrics = metric_table(name,seed,horizon,arrays,names)
+                metrics["selected_epoch"] = selected_epoch
+                metrics["final_train_standardized_mse"] = final_loss
+                dest = args.outdir/f"h{horizon}"/name/f"seed{seed}"
+                dest.mkdir(parents=True,exist_ok=True)
+                frame.to_csv(dest/"predictions.csv",index=False)
+                metrics.to_csv(dest/"metrics.csv",index=False)
+                torch.save({"model_state_dict":model.state_dict(),
+                            "model":name,"horizon":horizon,"seed":seed,
+                            "selected_epoch":selected_epoch},
+                           dest/"model.pt")
+                history.insert(0,"model",name)
+                history.insert(1,"horizon",horizon)
+                history.insert(2,"seed",seed)
+                history["selected_epoch"] = selected_epoch
+                history.to_csv(dest/"validation_history.csv",index=False)
+                all_histories.append(history)
+                all_predictions.append(frame)
+                all_metrics.append(metrics)
+                inventory.append({"model":name,"horizon":horizon,
+                                  "seed":seed,"selected_epoch":selected_epoch,
+                                  "parameters":sum(p.numel() for p in model.parameters()
+                                                   if p.requires_grad),
+                                  "fit":"node_balanced_MSE"})
+    metrics = pd.concat(all_metrics,ignore_index=True)
+    predictions = pd.concat(all_predictions,ignore_index=True)
+    metrics.to_csv(args.outdir/"all_seed_metrics_ALL_HORIZONS.csv",index=False)
+    predictions.to_csv(args.outdir/"all_seed_predictions_ALL_HORIZONS.csv",index=False)
+    summarize(metrics).to_csv(args.outdir/"summary_mean_std_ALL_HORIZONS.csv",
+                              index=False)
+    pd.DataFrame(inventory).to_csv(args.outdir/"model_inventory.csv",index=False)
+    if all_histories:
+        pd.concat(all_histories,ignore_index=True).to_csv(
+            args.outdir/"validation_history_ALL_HORIZONS.csv",index=False
         )
-
-    with open(outdir / "run_config.json", "w", encoding="utf-8") as stream:
-        json.dump(
-            {
-                **vars(args),
-                "rows": len(values),
-                "nodes": len(names),
-                "zero_codes_restored_to_nan": panel.zero_count,
-                "horizons": args.horizons,
-                "train_end_exclusive": train_end,
-                "validation_end_exclusive": val_end,
-                "test_first_target_date_by_horizon": {
-                    str(h): dates[val_end + h - 1].date().isoformat()
-                    for h in args.horizons
-                },
-                "test_split_first_date": dates[val_end].date().isoformat(),
-                "test_last_date": dates[-1].date().isoformat(),
-                "split_protocol": "60_train_10_validation_30_test",
-                "deep_refit_on_first_70_percent": True,
-                "test_used_for_selection": False,
-                "deep_training_objective": "node_balanced_MSE",
-                "reported_metrics": ["MSE", "MAE"],
-                "deep_config": asdict(deep_config),
-                "graph_config": asdict(graph_config),
-                "device_used": str(device),
-            },
-            stream,
-            ensure_ascii=False,
-            indent=2,
-        )
-        
-    print("\n" + "="*60)
-    print("ALL HORIZONS DONE (BASELINES)")
-    print("="*60)
-    print("\nBaseline V5 mean/std")
-    print(summary.to_string(index=False))
-    print(f"\nSaved Baseline V5 results to: {outdir.resolve()}")
+    config = {key:(str(value) if isinstance(value,Path) else value)
+              for key,value in vars(args).items()}
+    config.update({
+        "data_resolved":str(args.data.resolve()),
+        "data_sha256":hashlib.sha256(args.data.read_bytes()).hexdigest(),
+        "rows":len(values),"nodes":len(names),"names":list(names),
+        "zero_codes_restored_to_nan":panel.zero_count,
+        "train_end_exclusive":train_end,"validation_end_exclusive":val_end,
+        "test_first_target_date_by_horizon":{
+            str(h):str(dates[val_end+h-1].date()) for h in horizons},
+        "split_protocol":"60_train_10_validation_30_test",
+        "refit_on_first_70_percent":True,
+        "neural_primary_loss":"equal-node training-standardized MSE on volatility",
+        "neural_validation":"equal-node training-standardized MSE at the requested horizon",
+        "traditional_fit":"OLS on volatility; QLIKE is reported only",
+        "dcrnn_graph":"one lookback-only GFEVD per forecast origin",
+        "dcrnn_graph_settings":asdict(graph_settings),
+        "dcrnn_future_calendar_assumption":(
+            "observed mask treated as a pre-announced trading schedule"
+            if args.dcrnn_decoder_calendar=="observed" else
+            "no future schedule supplied; all decoder days treated as open"
+        ),
+        "reported_metrics":["MSE","MAE","QLIKE"],
+        "qlike_floor_volatility_pct":FLOOR,
+        "device_used":str(device),
+    })
+    with (args.outdir/"run_config.json").open("w",encoding="utf-8") as stream:
+        json.dump(config,stream,indent=2,ensure_ascii=False)
+    print(f"Saved baseline results to {args.outdir.resolve()}",flush=True)
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
-
-
-# In[ ]:
-
-
-
-

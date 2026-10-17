@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "Please cite the accompanying preprint when using this software."
+title: "Forecasting Global Equity Volatility: Econometric Anchoring and Cross-Market Attention"
+type: software
+authors:
+  - family-names: Zhao
+    given-names: Xinlin
+  - family-names: Qiao
+    given-names: Haotian
+repository-code: "https://github.com/cillinzhao/PGA-Trans-HAR"
+license: MIT
+abstract: >-
+  Reproduction code for HAR-anchored volatility forecasting with rolling
+  econometric graph priors and learned fixed market-specific attention gates.

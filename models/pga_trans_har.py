@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# MSE retest based on the fixed-market-gate V5 model. The default CSV
+# contains daily high-low Parkinson volatility proxies in percent; it is not
+# the five-minute realized-volatility panel used in the earlier manuscript.
+# Run this script in a Python environment with NumPy, pandas, and PyTorch.
+
 # In[1]:
 
 
@@ -8,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -17,7 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
-# The user's Anaconda NumPy and PyTorch distributions may bundle separate
+# Some NumPy and PyTorch distributions may bundle separate
 # Intel OpenMP runtimes.  Set this before importing either package so the
 # script remains runnable in that environment.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -32,7 +38,8 @@ from torch.utils.data import DataLoader, Dataset
 
 
 EPS = 1e-6
-MODEL_NAME = "PGA-Trans-HAR-V5"
+QLIKE_VOL_FLOOR = 1e-4  # Volatility is expressed in percent, not variance units.
+MODEL_NAME = "PGA-Trans-HAR-V5-MSE-Retest"
 
 
 # ---------------------------------------------------------------------------
@@ -81,8 +88,8 @@ def load_panel(path: str | Path, input_format: str = "sqrt_rv") -> PanelData:
     values = np.where(observed, raw, np.nan)
     if input_format == "rv":
         values = 100.0 * np.sqrt(values)
-    elif input_format != "sqrt_rv":
-        raise ValueError("--input-format must be sqrt_rv or rv.")
+    elif input_format not in ("sqrt_rv", "vol_pct"):
+        raise ValueError("--input-format must be vol_pct, sqrt_rv, or rv.")
     return PanelData(
         values=values,
         dates=frame.index,
@@ -124,10 +131,10 @@ def make_windows(
     for target_idx in range(target_start, target_end):
         input_end = target_idx - horizon + 1    # [修改] 根据 horizon 确定信息截止点
         input_start = input_end - seq_len       # [修改] 
-        
+
         if input_start < 0:                     # [新增] 越界保护
             continue
-            
+
         raw_x = values[input_start : input_end] # [修改]
         raw_y = values[target_idx]
         x_mask = np.isfinite(raw_x).astype(np.float32)
@@ -183,7 +190,7 @@ def har_features_numpy(
 def fit_har_anchor(
     values: np.ndarray, target_end: int, seq_len: int, horizon: int = 1
 ) -> np.ndarray:
-    
+
     X, Xm, Y, Ym, _ = make_windows(values, seq_len, target_end, seq_len, horizon)
     features, feature_ok = har_features_numpy(X, Xm)
     target = Y[..., 0]
@@ -209,25 +216,36 @@ def apply_har_numpy(features: np.ndarray, coefficients: np.ndarray) -> np.ndarra
     )
 
 
+def qlike_from_volatility_numpy(
+    target: np.ndarray, prediction: np.ndarray
+) -> np.ndarray:
+    """Patton QLIKE on variance proxies when both inputs are volatilities."""
+    y = np.maximum(np.asarray(target, dtype=np.float64), QLIKE_VOL_FLOOR)
+    p = np.maximum(np.asarray(prediction, dtype=np.float64), QLIKE_VOL_FLOOR)
+    log_ratio = 2.0 * (np.log(y) - np.log(p))
+    return np.expm1(log_ratio) - log_ratio
+
+
 def training_statistics(
-    values: np.ndarray, target_end: int, seq_len: int, har_coefficients: np.ndarray, horizon: int = 1
+    values: np.ndarray, target_end: int, seq_len: int,
+    har_coefficients: np.ndarray, horizon: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    
+    """Training-only target scales and frozen-HAR MSE; no validation leakage."""
     X, Xm, Y, Ym, _ = make_windows(values, seq_len, target_end, seq_len, horizon)
     features, _ = har_features_numpy(X, Xm)
     har = np.maximum(apply_har_numpy(features, har_coefficients), EPS)
     y = Y[..., 0]
     mask = Ym[..., 0] > 0.5
     N = y.shape[1]
-    scales = np.ones(N, dtype=np.float64)
-    har_mse = np.ones(N, dtype=np.float64)
+    scales = np.empty(N, dtype=np.float64)
+    har_mse = np.empty(N, dtype=np.float64)
     for node in range(N):
         active = mask[:, node]
+        if not np.any(active):
+            raise ValueError(f"No observed HAR reference targets for node {node}.")
         observed = y[active, node]
         scales[node] = max(float(np.std(observed, ddof=1)), 1e-3)
-        har_mse[node] = max(
-            float(np.mean((har[active, node] - observed) ** 2)), 1e-6
-        )
+        har_mse[node] = max(float(np.mean((har[active, node] - observed) ** 2)), 1e-6)
     return scales.astype(np.float32), har_mse.astype(np.float32)
 
 
@@ -749,17 +767,17 @@ class RobustRelativeMSE(nn.Module):
     ):
         super().__init__()
         self.register_buffer("node_scale", torch.as_tensor(node_scale).view(1, -1))
-        self.register_buffer(
-            "har_reference_mse", torch.as_tensor(har_reference_mse).view(1, -1)
-        )
+        self.register_buffer("har_reference_mse", torch.as_tensor(har_reference_mse).view(1, -1))
         self.robust_lambda = float(robust_lambda)
         self.temperature = float(temperature)
 
     def components(self, prediction, target, mask):
-        error2 = (prediction[..., 0] - target[..., 0]) ** 2
         active = mask[..., 0]
+        error2 = (prediction[..., 0] - target[..., 0]).square()
         counts = active.sum(dim=0)
         valid = counts > 0
+        if not torch.any(valid):
+            raise ValueError("Training batch contains no observed target.")
         node_mse = (error2 * active).sum(dim=0) / counts.clamp_min(1.0)
         standardized = node_mse / self.node_scale[0].square().clamp_min(1e-8)
         base = standardized[valid].mean()
@@ -859,22 +877,25 @@ def collect_predictions(model, loader, device, return_aux=False):
 
 def objective_from_arrays(
     arrays: dict,
-    node_scale: np.ndarray,
-    har_reference_mse: np.ndarray,
+    training_stats: Tuple[np.ndarray, np.ndarray],
     robust_lambda: float,
     temperature: float,
 ) -> dict:
     prediction = arrays["prediction"]
     target = arrays["target"]
     mask = arrays["mask"] > 0.5
+    node_scale, har_reference_mse = training_stats
     node_mse = np.zeros(target.shape[1], dtype=np.float64)
+    valid = mask.sum(axis=0) > 0
+    if not np.any(valid):
+        raise ValueError("Validation set contains no observed target.")
     for node in range(target.shape[1]):
         active = mask[:, node]
-        node_mse[node] = np.mean(
-            (prediction[active, node] - target[active, node]) ** 2
-        )
-    base = float(np.mean(node_mse / np.maximum(node_scale, 1e-8) ** 2))
-    relative = node_mse / np.maximum(har_reference_mse, 1e-8)
+        if not np.any(active):
+            continue
+        node_mse[node] = np.mean((target[active, node] - prediction[active, node]) ** 2)
+    base = float(np.mean(node_mse[valid] / np.maximum(node_scale[valid], 1e-8) ** 2))
+    relative = node_mse[valid] / np.maximum(har_reference_mse[valid], 1e-8)
     centered = (relative - 1.0) / temperature
     maximum = float(np.max(centered))
     log_mean_exp = maximum + math.log(float(np.mean(np.exp(centered - maximum))))
@@ -882,8 +903,8 @@ def objective_from_arrays(
     return {
         "objective": base + robust_lambda * smooth_worst,
         "base_standardized_mse": base,
-        "smooth_worst_relative_regret": smooth_worst,
-        "mean_raw_mse": float(node_mse.mean()),
+        "smooth_worst_relative_mse_regret": smooth_worst,
+        "mean_raw_mse": float(node_mse[valid].mean()),
         "max_relative_mse": float(relative.max()),
     }
 
@@ -914,8 +935,7 @@ def select_epoch_on_validation(
     train_loader,
     val_loader,
     objective,
-    node_scale,
-    har_reference_mse,
+    training_stats,
     config,
     device,
 ):
@@ -937,8 +957,7 @@ def select_epoch_on_validation(
         validation = collect_predictions(model, val_loader, device)
         scores = objective_from_arrays(
             validation,
-            node_scale,
-            har_reference_mse,
+            training_stats,
             config.robust_lambda,
             config.robust_temperature,
         )
@@ -1002,6 +1021,9 @@ def metric_table(target, prediction, mask, names, seed, horizon) -> pd.DataFrame
     for node, name in enumerate(names):
         active = mask[:, node]
         error = prediction[active, node] - target[active, node]
+        qlike = qlike_from_volatility_numpy(
+            target[active, node], prediction[active, node]
+        )
         rows.append(
             {
                 "model": MODEL_NAME,
@@ -1012,6 +1034,7 @@ def metric_table(target, prediction, mask, names, seed, horizon) -> pd.DataFrame
                 "n_active": int(active.sum()),
                 "MSE": float(np.mean(error ** 2)),
                 "MAE": float(np.mean(np.abs(error))),
+                "QLIKE": float(np.mean(qlike)),
             }
         )
     return pd.DataFrame(rows)
@@ -1107,8 +1130,10 @@ def summarize_metrics(metrics: pd.DataFrame) -> pd.DataFrame:
             MSE_std=("MSE", "std"),
             MAE_mean=("MAE", "mean"),
             MAE_std=("MAE", "std"),
+            QLIKE_mean=("QLIKE", "mean"),
+            QLIKE_std=("QLIKE", "std"),
         )
-        .fillna({"MSE_std": 0.0, "MAE_std": 0.0})
+        .fillna({"MSE_std": 0.0, "MAE_std": 0.0, "QLIKE_std": 0.0})
     )
 
 
@@ -1148,6 +1173,7 @@ def metrics_from_ensemble(ensemble: pd.DataFrame, horizon: int) -> pd.DataFrame:
                 "n_active": int(active.sum()),
                 "MSE": float(np.mean((p - y) ** 2)),
                 "MAE": float(np.mean(np.abs(p - y))),
+                "QLIKE": float(np.mean(qlike_from_volatility_numpy(y, p))),
                 "n_seeds": int(group["n_seeds"].min()),
             }
         )
@@ -1193,9 +1219,18 @@ def choose_device(requested: str) -> torch.device:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="df_union_sqrt.csv", help="CSV path, e.g. df_union_sqrt.csv")
-    parser.add_argument("--input-format", choices=["sqrt_rv", "rv"], default="sqrt_rv")
-    parser.add_argument("--outdir", default="pga_results_v5_fixed_node_gate")
+    parser.add_argument(
+        "--data",
+        default=str(Path(__file__).resolve().parents[1]
+                    / "data/df_union_sqrt.csv"),
+        help="CSV path containing positive volatility in percent (or use --input-format rv).",
+    )
+    parser.add_argument(
+        "--input-format", choices=["vol_pct", "sqrt_rv", "rv"], default="vol_pct"
+    )
+    parser.add_argument(
+        "--outdir", default=str(Path(__file__).resolve().parents[1] / "results" / "main")
+    )
     parser.add_argument("--horizons", nargs="+", type=int, default=[1, 5, 22])  # 新增 horizons 参数
     parser.add_argument("--seeds", nargs="+", type=int, default=[1, 2, 3, 4, 5])
     parser.add_argument("--train-ratio", type=float, default=0.60)
@@ -1248,6 +1283,8 @@ def main() -> None:
     train_end, val_end = fixed_split(T, args.train_ratio, args.val_ratio)
     device = choose_device(args.device)
     outdir = Path(args.outdir)
+    if "qlike" in outdir.name.lower():
+        raise ValueError("Refusing to write MSE results into a QLIKE-named output directory.")
     outdir.mkdir(parents=True, exist_ok=True)
 
     config = TrainConfig(
@@ -1279,7 +1316,7 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"=== Starting Forecast Horizon: h = {h} ===")
         print(f"{'='*60}\n")
-        
+
         # 为每个 horizon 创建独立的输出目录
         outdir_h = outdir / f"h{h}"
         outdir_h.mkdir(parents=True, exist_ok=True)
@@ -1305,7 +1342,7 @@ def main() -> None:
             raise AssertionError("Validation forecast origin is not split-safe.")
         if int(test_windows[4][0]) - h != val_end - 1:
             raise AssertionError("Test forecast origin is not split-safe.")
-        
+
         # 获取所有生成过的合法 target index，避免遗漏
         all_target_indices = np.unique(np.concatenate([
             train_windows[4], val_windows[4], refit_windows[4], test_windows[4]
@@ -1336,17 +1373,17 @@ def main() -> None:
         val_dataset = ForecastDataset(val_windows, priors_for(val_windows))
         refit_dataset = ForecastDataset(refit_windows, priors_for(refit_windows))
         test_dataset = ForecastDataset(test_windows, priors_for(test_windows))
-        
+
         val_loader = make_loader(val_dataset, config.batch_size, shuffle=False)
         test_loader = make_loader(test_dataset, config.batch_size, shuffle=False)
 
         # 计算支持 horizon 的 HAR Baseline
         har_dev = fit_har_anchor(values, train_end, args.seq_len, horizon=h)
-        scale_dev, har_mse_dev = training_statistics(
+        training_stats_dev = training_statistics(
             values, train_end, args.seq_len, har_dev, horizon=h
         )
         har_refit = fit_har_anchor(values, val_end, args.seq_len, horizon=h)
-        scale_refit, har_mse_refit = training_statistics(
+        training_stats_refit = training_statistics(
             values, val_end, args.seq_len, har_refit, horizon=h
         )
 
@@ -1354,7 +1391,7 @@ def main() -> None:
             "graph_end_exclusive"
         ].map(lambda end: pd.Timestamp(dates[int(end) - 1]).date().isoformat())
         graph_diagnostics.to_csv(outdir_h / f"dynamic_graph_diagnostics_h{h}.csv", index=False)
-        
+
         all_manifest, common_manifest = date_manifests(test_windows, dates, names, horizon=h)
         all_manifest.to_csv(outdir_h / f"test_date_manifest_all_days_h{h}.csv", index=False)
         common_manifest.to_csv(outdir_h / f"test_date_manifest_common_days_h{h}.csv", index=False)
@@ -1362,17 +1399,16 @@ def main() -> None:
         all_metrics, all_predictions, all_gates, all_fixed_gates, histories = (
             [], [], [], [], []
         )
-        
+
         for seed in args.seeds:
             print(f"\n--- [h={h}] Seed {seed}: development training and validation ---", flush=True)
             train_loader = make_loader(train_dataset, config.batch_size, shuffle=True)
             dev_objective = RobustRelativeMSE(
-                scale_dev,
-                har_mse_dev,
+                *training_stats_dev,
                 config.robust_lambda,
                 config.robust_temperature,
             ).to(device)
-            
+
             dev_model = build_model(N, har_dev, config, seed, device)
             if parameter_count is None:
                 parameter_count = sum(
@@ -1380,14 +1416,13 @@ def main() -> None:
                     for parameter in dev_model.parameters()
                     if parameter.requires_grad
                 )
-                
+
             dev_model, best_epoch, history = select_epoch_on_validation(
                 dev_model,
                 train_loader,
                 val_loader,
                 dev_objective,
-                scale_dev,
-                har_mse_dev,
+                training_stats_dev,
                 config,
                 device,
             )
@@ -1407,12 +1442,11 @@ def main() -> None:
                 )
                 refit_loader = make_loader(refit_dataset, config.batch_size, shuffle=True)
                 refit_objective = RobustRelativeMSE(
-                    scale_refit,
-                    har_mse_refit,
+                    *training_stats_refit,
                     config.robust_lambda,
                     config.robust_temperature,
                 ).to(device)
-                
+
                 final_model = build_model(N, har_refit, config, seed, device)
                 final_model, final_train_loss = refit_fixed_epochs(
                     final_model,
@@ -1459,7 +1493,7 @@ def main() -> None:
                 seed_dir / f"fixed_attention_gates_h{h}_seed{seed}.csv",
                 index=False,
             )
-            
+
             torch.save(
                 {
                     "model_state_dict": final_model.state_dict(),
@@ -1477,7 +1511,7 @@ def main() -> None:
                 },
                 seed_dir / f"model_h{h}_seed{seed}.pt",
             )
-            
+
             all_metrics.append(metrics)
             all_predictions.append(predictions)
             all_gates.append(gates)
@@ -1489,10 +1523,10 @@ def main() -> None:
         gate_frame_all = pd.concat(all_gates, ignore_index=True)
         fixed_gate_frame_all = pd.concat(all_fixed_gates, ignore_index=True)
         history_frame = pd.concat(histories, ignore_index=True)
-        
+
         summary = summarize_metrics(metrics_frame)
         ensemble, ensemble_metrics = ensemble_outputs(prediction_frame_all, horizon=h)
-        
+
         common_target_indices = set(common_manifest["target_idx"].astype(int).unique())
         ensemble_common = ensemble[
             ensemble["target_idx"].astype(int).isin(common_target_indices)
@@ -1517,7 +1551,7 @@ def main() -> None:
         ensemble_common_metrics.to_csv(
             outdir_h / f"seed_ensemble_metrics_common_days_h{h}.csv", index=False
         )
-        
+
         # 加入全局列表，用于最后在终端打印和输出总的汇总 csv
         global_summary_metrics.append(summary)
         global_ensemble_metrics.append(ensemble_metrics)
@@ -1527,7 +1561,7 @@ def main() -> None:
     final_summary = pd.concat(global_summary_metrics, ignore_index=True)
     final_ensemble = pd.concat(global_ensemble_metrics, ignore_index=True)
     final_ensemble_common = pd.concat(global_ensemble_common_metrics, ignore_index=True)
-    
+
     final_summary.to_csv(outdir / "summary_mean_std_ALL_HORIZONS.csv", index=False)
     final_ensemble.to_csv(outdir / "seed_ensemble_metrics_ALL_HORIZONS.csv", index=False)
     final_ensemble_common.to_csv(outdir / "seed_ensemble_metrics_common_days_ALL_HORIZONS.csv", index=False)
@@ -1537,6 +1571,7 @@ def main() -> None:
             {
                 "model": MODEL_NAME,
                 "data": str(args.data),
+                "data_sha256": hashlib.sha256(Path(args.data).read_bytes()).hexdigest(),
                 "input_format": args.input_format,
                 "zero_codes_restored_to_nan": panel.zero_count,
                 "rows": T,
@@ -1584,10 +1619,13 @@ def main() -> None:
                 "attention_gate_initial_value": float(torch.sigmoid(torch.tensor(-0.5))),
                 "attention_gate_interpretation": "g_n=1 data attention; g_n=0 prior graph",
                 "training_objective": (
-                    "mean node-standardized MSE + lambda * "
-                    "smooth-worst(node MSE / training HAR MSE - 1)"
+                    "mean active-node standardized MSE on volatility + lambda * "
+                    "smooth-worst(node MSE / training frozen-HAR MSE - 1)"
                 ),
-                "reported_metrics": ["MSE", "MAE"],
+                "qlike_definition": "RV/h_hat - log(RV/h_hat) - 1; RV=y_vol^2, h_hat=pred_vol^2",
+                "qlike_volatility_floor_pct": QLIKE_VOL_FLOOR,
+                "har_anchor_fit": "frozen horizon-specific OLS on volatility scale",
+                "reported_metrics": ["MSE", "MAE", "QLIKE"],
             },
             stream,
             ensure_ascii=False,
@@ -1608,6 +1646,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
